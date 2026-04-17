@@ -7,7 +7,7 @@ use crate::config::{self, Config};
 use crate::db::{Database, MediaFile, Tag};
 use crate::player::Player;
 use crate::scanner::{self, ScanEvent};
-use crate::thumbnail::{self, ThumbnailResult};
+use crate::thumbnail::ThumbnailWorker;
 use crate::ui::gallery::{self, GalleryAction, GalleryState};
 use crate::ui::sidebar::{self, SidebarAction, SidebarState};
 use crate::ui::tag_editor::{self, TagEditorAction, TagEditorState};
@@ -40,8 +40,8 @@ pub struct MediaManagerApp {
     scan_receiver: Option<mpsc::Receiver<ScanEvent>>,
     scanning: bool,
 
-    // Background thumbnail generation
-    thumb_receiver: Option<mpsc::Receiver<ThumbnailResult>>,
+    // Background thumbnail generation (persistent worker)
+    thumb_worker: ThumbnailWorker,
 
     // Status message
     status: String,
@@ -64,12 +64,14 @@ impl MediaManagerApp {
         let media_root = config::media_dir(&config);
         let scan_rx = scanner::scan_media_background(media_root.clone(), known_paths);
 
-        // Start thumbnail generation for existing files
-        let thumb_rx = thumbnail::generate_thumbnails_background(
-            media_files.clone(),
-            media_root,
-            config.thumbnail_width,
-        );
+        // Start single persistent thumbnail worker and queue initial files
+        let mut thumb_worker =
+            ThumbnailWorker::start(media_root, config.thumbnail_width);
+        for f in &media_files {
+            if f.thumbnail_path.is_none() {
+                thumb_worker.queue(f.clone());
+            }
+        }
 
         let columns = config.gallery_columns;
 
@@ -87,7 +89,7 @@ impl MediaManagerApp {
             tag_editor_state: TagEditorState::default(),
             scan_receiver: Some(scan_rx),
             scanning: true,
-            thumb_receiver: Some(thumb_rx),
+            thumb_worker,
             status: "Scanning...".to_string(),
         };
         app.update_extensions();
@@ -109,12 +111,16 @@ impl MediaManagerApp {
             None => return,
         };
 
-        let mut new_files_added = false;
+        // Cap per-frame work so the scanner can't flood the main thread with
+        // a huge batch of new files in a single frame.
+        const MAX_EVENTS_PER_FRAME: usize = 64;
 
-        loop {
+        let mut new_files_added = false;
+        let mut finished = false;
+
+        for _ in 0..MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(ScanEvent::NewFile(file)) => {
-                    // Insert into DB
                     self.db.upsert_media(
                         &file.relative_path,
                         &file.filename,
@@ -122,32 +128,15 @@ impl MediaManagerApp {
                         file.file_size,
                     ).ok();
 
-                    // Fetch the full record from DB to get id, created_at, etc.
                     if let Ok(Some(media)) = self.db.get_media_by_path(&file.relative_path) {
-                        // Generate thumbnail in background for this file
-                        let media_root = config::media_dir(&self.config);
-                        let thumb_width = self.config.thumbnail_width;
-                        let media_clone = media.clone();
-                        let thumb_rx = thumbnail::generate_thumbnails_background(
-                            vec![media_clone],
-                            media_root,
-                            thumb_width,
-                        );
-                        // Poll immediately — it's a single file, likely fast
-                        // But store receiver if we already have one
-                        if self.thumb_receiver.is_none() {
-                            self.thumb_receiver = Some(thumb_rx);
-                        }
-
+                        self.thumb_worker.queue(media.clone());
                         self.media_files.push(media);
                         new_files_added = true;
                     }
                 }
                 Ok(ScanEvent::Finished { all_paths, total, new_count }) => {
-                    // Remove files that no longer exist on disk
                     let removed = self.db.delete_missing(&all_paths).unwrap_or(0);
                     if removed > 0 {
-                        // Refresh full list since items were removed
                         self.refresh_media_list();
                     }
                     self.status = format!(
@@ -156,29 +145,16 @@ impl MediaManagerApp {
                     );
                     self.scanning = false;
                     self.scan_receiver = None;
-
-                    // Start thumbnail pass for any remaining files without thumbs
-                    let media_root = config::media_dir(&self.config);
-                    let files_needing_thumbs: Vec<_> = self.media_files
-                        .iter()
-                        .filter(|f| f.thumbnail_path.is_none())
-                        .cloned()
-                        .collect();
-                    if !files_needing_thumbs.is_empty() {
-                        self.thumb_receiver = Some(thumbnail::generate_thumbnails_background(
-                            files_needing_thumbs,
-                            media_root,
-                            self.config.thumbnail_width,
-                        ));
-                    }
-                    return;
+                    finished = true;
+                    break;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.scanning = false;
                     self.scan_receiver = None;
                     self.status = "Scan finished".to_string();
-                    return;
+                    finished = true;
+                    break;
                 }
             }
         }
@@ -188,14 +164,25 @@ impl MediaManagerApp {
             self.tags_with_counts = self.db.get_tag_counts().unwrap_or_default();
             self.all_tags = self.db.get_all_tags().unwrap_or_default();
         }
+
+        // Update status while scan is in progress to show activity.
+        if self.scanning && !finished {
+            self.status = format!("Scanning... {} files so far", self.media_files.len());
+        }
     }
 
     fn refresh_media_list(&mut self) {
-        let mut files = if self.sidebar_state.selected_tags.is_empty() {
+        let mut files = if self.sidebar_state.included_tags.is_empty()
+            && self.sidebar_state.excluded_tags.is_empty()
+        {
             self.db.get_all_media().unwrap_or_default()
         } else {
             self.db
-                .get_media_by_tags(&self.sidebar_state.selected_tags, self.sidebar_state.match_all)
+                .get_media_by_tag_filter(
+                    &self.sidebar_state.included_tags,
+                    &self.sidebar_state.excluded_tags,
+                    self.sidebar_state.match_all,
+                )
                 .unwrap_or_default()
         };
 
@@ -253,16 +240,13 @@ impl MediaManagerApp {
     }
 
     fn poll_thumbnails(&mut self) {
-        if let Some(rx) = &self.thumb_receiver {
-            while let Ok(result) = rx.try_recv() {
-                if let Some(thumb_filename) = result.thumb_filename {
-                    self.db
-                        .set_thumbnail(result.media_id, &thumb_filename, false)
-                        .ok();
-                    // Update in-memory list
-                    if let Some(file) = self.media_files.iter_mut().find(|f| f.id == result.media_id) {
-                        file.thumbnail_path = Some(thumb_filename);
-                    }
+        while let Some(result) = self.thumb_worker.try_recv() {
+            if let Some(thumb_filename) = result.thumb_filename {
+                self.db
+                    .set_thumbnail(result.media_id, &thumb_filename, false)
+                    .ok();
+                if let Some(file) = self.media_files.iter_mut().find(|f| f.id == result.media_id) {
+                    file.thumbnail_path = Some(thumb_filename);
                 }
             }
         }
@@ -347,7 +331,8 @@ impl eframe::App for MediaManagerApp {
                         }
                         SidebarAction::DeleteTag(tag_id) => {
                             self.db.delete_tag(tag_id).ok();
-                            self.sidebar_state.selected_tags.retain(|&id| id != tag_id);
+                            self.sidebar_state.included_tags.retain(|&id| id != tag_id);
+                            self.sidebar_state.excluded_tags.retain(|&id| id != tag_id);
                             self.refresh_media_list();
                         }
                         SidebarAction::FilterChanged => {
@@ -370,6 +355,20 @@ impl eframe::App for MediaManagerApp {
                     ui.label(&self.status);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!("{} files", self.media_files.len()));
+                        ui.separator();
+                        let mut cols = self.gallery_state.columns;
+                        let slider = ui.add_sized(
+                            [140.0, 18.0],
+                            egui::Slider::new(&mut cols, 3..=10).show_value(false),
+                        );
+                        ui.label(format!("Columns: {}", cols));
+                        if slider.changed() {
+                            self.gallery_state.columns = cols;
+                            if self.config.gallery_columns != cols {
+                                self.config.gallery_columns = cols;
+                                config::save_config(&self.config);
+                            }
+                        }
                     });
                 });
             });
@@ -440,8 +439,8 @@ impl eframe::App for MediaManagerApp {
             }
         });
 
-        // Request repaint if thumbnails are still being generated
-        if self.thumb_receiver.is_some() || self.scanning {
+        // Request repaint while background work is in progress
+        if self.scanning || self.thumb_worker.busy() {
             ctx.request_repaint();
         }
     }

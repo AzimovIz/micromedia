@@ -160,38 +160,55 @@ impl Database {
         Ok(set)
     }
 
-    pub fn get_media_by_tags(&self, tag_ids: &[i64], match_all: bool) -> Result<Vec<MediaFile>> {
-        if tag_ids.is_empty() {
+    pub fn get_media_by_tag_filter(
+        &self,
+        included: &[i64],
+        excluded: &[i64],
+        match_all: bool,
+    ) -> Result<Vec<MediaFile>> {
+        if included.is_empty() && excluded.is_empty() {
             return self.get_all_media();
         }
 
-        let placeholders: Vec<String> = tag_ids.iter().map(|_| "?".to_string()).collect();
-        let ph = placeholders.join(",");
+        let mut sql = String::from(
+            "SELECT m.id, m.path, m.filename, m.media_type, m.file_size, m.duration_secs, m.thumbnail_path, m.custom_thumbnail, m.created_at
+             FROM media_files m
+             WHERE 1=1"
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        let query = if match_all {
-            format!(
-                "SELECT m.id, m.path, m.filename, m.media_type, m.file_size, m.duration_secs, m.thumbnail_path, m.custom_thumbnail, m.created_at
-                 FROM media_files m
-                 JOIN media_tags mt ON m.id = mt.media_id
-                 WHERE mt.tag_id IN ({})
-                 GROUP BY m.id
-                 HAVING COUNT(DISTINCT mt.tag_id) = {}
-                 ORDER BY m.filename",
-                ph, tag_ids.len()
-            )
-        } else {
-            format!(
-                "SELECT DISTINCT m.id, m.path, m.filename, m.media_type, m.file_size, m.duration_secs, m.thumbnail_path, m.custom_thumbnail, m.created_at
-                 FROM media_files m
-                 JOIN media_tags mt ON m.id = mt.media_id
-                 WHERE mt.tag_id IN ({})
-                 ORDER BY m.filename",
+        if !included.is_empty() {
+            let ph = included.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            if match_all {
+                sql.push_str(&format!(
+                    " AND (SELECT COUNT(DISTINCT mt.tag_id) FROM media_tags mt WHERE mt.media_id = m.id AND mt.tag_id IN ({})) = {}",
+                    ph, included.len()
+                ));
+            } else {
+                sql.push_str(&format!(
+                    " AND EXISTS (SELECT 1 FROM media_tags mt WHERE mt.media_id = m.id AND mt.tag_id IN ({}))",
+                    ph
+                ));
+            }
+            for id in included {
+                params.push(Box::new(*id));
+            }
+        }
+
+        if !excluded.is_empty() {
+            let ph = excluded.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM media_tags mt WHERE mt.media_id = m.id AND mt.tag_id IN ({}))",
                 ph
-            )
-        };
+            ));
+            for id in excluded {
+                params.push(Box::new(*id));
+            }
+        }
 
-        let mut stmt = self.conn.prepare(&query)?;
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = tag_ids.iter().map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>).collect();
+        sql.push_str(" ORDER BY m.filename");
+
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok(MediaFile {
                 id: row.get(0)?,

@@ -246,6 +246,8 @@ impl Player {
             opt("hwdec", "no");
             opt("video-timing-offset", "0");
             opt("idle", "yes");
+            opt("keep-open", "yes");
+            opt("keep-open-pause", "yes");
             opt("input-default-bindings", "no");
             opt("input-vo-keyboard", "no");
             opt("osc", "no");
@@ -330,6 +332,15 @@ impl Player {
     }
 
     pub fn toggle_pause(&mut self) {
+        // With keep-open=yes mpv pauses at EOF. Unpausing there would immediately
+        // re-hit EOF, so rewind to start when the user hits play at the end.
+        if !self.is_playing
+            && self.duration > 0.0
+            && self.position >= self.duration - 0.5
+        {
+            self.seek(0.0);
+        }
+
         let mpv = match &self.mpv {
             Some(m) => m,
             None => {

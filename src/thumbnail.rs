@@ -67,35 +67,63 @@ pub struct ThumbnailResult {
     pub thumb_filename: Option<String>,
 }
 
-/// Spawns a background thread to generate thumbnails for all media without one.
-/// Returns a receiver to poll for results.
-pub fn generate_thumbnails_background(
-    media_files: Vec<MediaFile>,
-    media_root: PathBuf,
-    thumbnail_width: u32,
-) -> mpsc::Receiver<ThumbnailResult> {
-    let (tx, rx) = mpsc::channel();
+/// Persistent background worker that processes thumbnail requests one-by-one.
+/// A single thread owns the ffmpeg invocations; the main thread queues files
+/// via `queue()` and drains completed results via `try_recv()`.
+pub struct ThumbnailWorker {
+    input: mpsc::Sender<MediaFile>,
+    output: mpsc::Receiver<ThumbnailResult>,
+    pending: usize,
+}
 
-    thread::spawn(move || {
-        for file in media_files {
-            if file.thumbnail_path.is_some() {
-                continue;
+impl ThumbnailWorker {
+    pub fn start(media_root: PathBuf, thumbnail_width: u32) -> Self {
+        let (in_tx, in_rx) = mpsc::channel::<MediaFile>();
+        let (out_tx, out_rx) = mpsc::channel::<ThumbnailResult>();
+
+        thread::spawn(move || {
+            while let Ok(file) = in_rx.recv() {
+                let full_path = media_root.join(&file.path);
+                let thumb = match file.media_type {
+                    MediaType::Video => generate_thumbnail(&full_path, file.id, thumbnail_width),
+                    MediaType::Image => generate_image_thumbnail(&full_path, file.id, thumbnail_width),
+                };
+                let _ = out_tx.send(ThumbnailResult {
+                    media_id: file.id,
+                    thumb_filename: thumb,
+                });
             }
+        });
 
-            let full_path = media_root.join(&file.path);
-            let thumb = match file.media_type {
-                MediaType::Video => generate_thumbnail(&full_path, file.id, thumbnail_width),
-                MediaType::Image => generate_image_thumbnail(&full_path, file.id, thumbnail_width),
-            };
-
-            let _ = tx.send(ThumbnailResult {
-                media_id: file.id,
-                thumb_filename: thumb,
-            });
+        ThumbnailWorker {
+            input: in_tx,
+            output: out_rx,
+            pending: 0,
         }
-    });
+    }
 
-    rx
+    pub fn queue(&mut self, file: MediaFile) {
+        if file.thumbnail_path.is_some() {
+            return;
+        }
+        if self.input.send(file).is_ok() {
+            self.pending += 1;
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Option<ThumbnailResult> {
+        match self.output.try_recv() {
+            Ok(r) => {
+                self.pending = self.pending.saturating_sub(1);
+                Some(r)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn busy(&self) -> bool {
+        self.pending > 0
+    }
 }
 
 fn find_ffmpeg() -> PathBuf {

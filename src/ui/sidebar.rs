@@ -28,7 +28,8 @@ impl SortMode {
 }
 
 pub struct SidebarState {
-    pub selected_tags: Vec<i64>,
+    pub included_tags: Vec<i64>,
+    pub excluded_tags: Vec<i64>,
     pub match_all: bool,
     pub new_tag_name: String,
     pub show_create_tag: bool,
@@ -41,7 +42,8 @@ pub struct SidebarState {
 impl Default for SidebarState {
     fn default() -> Self {
         Self {
-            selected_tags: Vec::new(),
+            included_tags: Vec::new(),
+            excluded_tags: Vec::new(),
             match_all: true,
             new_tag_name: String::new(),
             show_create_tag: false,
@@ -125,66 +127,91 @@ pub fn show_sidebar(
         });
 
     ui.separator();
-    ui.heading("Tags");
 
-    // Match mode toggle
-    ui.horizontal(|ui| {
-        ui.label("Filter:");
-        if ui.selectable_label(state.match_all, "AND").clicked() {
-            state.match_all = true;
-            action = SidebarAction::FilterChanged;
-        }
-        if ui.selectable_label(!state.match_all, "OR").clicked() {
-            state.match_all = false;
-            action = SidebarAction::FilterChanged;
-        }
-    });
-
-    ui.separator();
-
-    // Tag list
-    if !state.selected_tags.is_empty() {
+    let filter_active = !state.included_tags.is_empty() || !state.excluded_tags.is_empty();
+    if filter_active {
         if ui.button("Clear filter").clicked() {
-            state.selected_tags.clear();
+            state.included_tags.clear();
+            state.excluded_tags.clear();
             action = SidebarAction::FilterChanged;
         }
         ui.separator();
     }
 
+    let include_color = egui::Color32::from_rgb(120, 200, 120);
+    let exclude_color = egui::Color32::from_rgb(220, 120, 120);
+    let mut pending_delete: Option<i64> = None;
+
     egui::ScrollArea::vertical()
         .max_height(ui.available_height() - 60.0)
         .show(ui, |ui| {
             for (tag, count) in tags {
-                let selected = state.selected_tags.contains(&tag.id);
-                let label = format!("{} ({})", tag.name, count);
+                let included = state.included_tags.contains(&tag.id);
+                let excluded = state.excluded_tags.contains(&tag.id);
 
-                let response = ui.horizontal(|ui| {
-                    let toggled = ui.selectable_label(selected, &label).clicked();
-
-                    let delete_clicked = ui
-                        .small_button("x")
-                        .on_hover_text("Delete tag")
-                        .clicked();
-
-                    (toggled, delete_clicked)
-                });
-
-                let (toggled, delete_clicked) = response.inner;
-
-                if toggled {
-                    if selected {
-                        state.selected_tags.retain(|&id| id != tag.id);
-                    } else {
-                        state.selected_tags.push(tag.id);
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(included, " + ")
+                        .on_hover_text("Include (show only items with this tag)")
+                        .clicked()
+                    {
+                        state.excluded_tags.retain(|&id| id != tag.id);
+                        if included {
+                            state.included_tags.retain(|&id| id != tag.id);
+                        } else {
+                            state.included_tags.push(tag.id);
+                        }
+                        action = SidebarAction::FilterChanged;
                     }
-                    action = SidebarAction::FilterChanged;
-                }
 
-                if delete_clicked {
-                    action = SidebarAction::DeleteTag(tag.id);
-                }
+                    if ui
+                        .selectable_label(excluded, " − ")
+                        .on_hover_text("Exclude (hide items with this tag)")
+                        .clicked()
+                    {
+                        state.included_tags.retain(|&id| id != tag.id);
+                        if excluded {
+                            state.excluded_tags.retain(|&id| id != tag.id);
+                        } else {
+                            state.excluded_tags.push(tag.id);
+                        }
+                        action = SidebarAction::FilterChanged;
+                    }
+
+                    let text = format!("{} ({})", tag.name, count);
+                    let rich = if included {
+                        egui::RichText::new(text).color(include_color).strong()
+                    } else if excluded {
+                        egui::RichText::new(text).color(exclude_color).strikethrough()
+                    } else {
+                        egui::RichText::new(text)
+                    };
+                    let name_resp = ui.label(rich);
+                    name_resp.context_menu(|ui| {
+                        if ui.button("Delete tag").clicked() {
+                            pending_delete = Some(tag.id);
+                            ui.close_menu();
+                        }
+                    });
+
+                    if included || excluded {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Remove from filter")
+                            .clicked()
+                        {
+                            state.included_tags.retain(|&id| id != tag.id);
+                            state.excluded_tags.retain(|&id| id != tag.id);
+                            action = SidebarAction::FilterChanged;
+                        }
+                    }
+                });
             }
         });
+
+    if let Some(id) = pending_delete {
+        action = SidebarAction::DeleteTag(id);
+    }
 
     ui.separator();
 
