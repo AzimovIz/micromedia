@@ -1,0 +1,49 @@
+// Milestone B: под этим UI mpv рисует видео (подложка через render API).
+// Фон окна прозрачный — Slint рисует поверх видео.
+
+export component MainWindow inherits Window {
+    preferred-width: 1280px;
+    preferred-height: 720px;
+    title: "MicroMedia — prototype";
+    background: transparent;
+
+    in property <string> status: "…";
+    callback toggle-play();
+
+    // Нижняя панель управления
+    VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 56px;
+            background: #101014e6;
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 12px;
+                alignment: start;
+
+                play-btn := Rectangle {
+                    width: 96px;
+                    background: touch.pressed ? #3a3a44 : (touch.has-hover ? #2a2a32 : #1d1d24);
+                    border-radius: 8px;
+                    Text {
+                        text: "⏯  Play/Pause";
+                        color: #e6e6e6;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    touch := TouchArea {
+                        clicked => { root.toggle-play(); }
+                    }
+                }
+
+                Text {
+                    text: root.status;
+                    color: #b8b8c0;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
