@@ -12,7 +12,7 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::db::{Db, MediaType};
 use crate::paths::Paths;
 
-const THUMB_MAX: u32 = 320;
+pub(crate) const THUMB_MAX: u32 = 320;
 const BATCH: i64 = 16;
 /// Позиция кадра для видео-превью (% длительности).
 const VIDEO_THUMB_PERCENT: u32 = 20;
@@ -110,7 +110,7 @@ pub fn spawn(paths: &Paths) {
 ///
 /// Пишем во временный файл и атомарно переименовываем — иначе UI может прочитать
 /// наполовину записанный JPEG (нижняя часть превью «серая»).
-fn make_image_thumb(src: &Path, dst: &Path) -> Result<(), String> {
+pub(crate) fn make_image_thumb(src: &Path, dst: &Path) -> Result<(), String> {
     let img = image::open(src).map_err(|e| e.to_string())?;
     // .thumbnail — быстрый ресайз с сохранением пропорций.
     let thumb = img.thumbnail(THUMB_MAX, THUMB_MAX).to_rgb8();

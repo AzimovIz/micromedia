@@ -374,9 +374,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rebuild_gallery();
 
     // Ленивая подгрузка миниатюр с кэшем (промахи не кэшируем).
+    let thumb_cache: Rc<RefCell<HashMap<String, slint::Image>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     {
-        let cache: Rc<RefCell<HashMap<String, slint::Image>>> =
-            Rc::new(RefCell::new(HashMap::new()));
+        let cache = thumb_cache.clone();
         window.on_load_thumb(move |path| {
             let key = path.as_str();
             if key.is_empty() {
@@ -1220,6 +1221,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 w.window().request_redraw();
             }
+        });
+    }
+
+    // «Set as thumbnail»: текущий кадр видео → миниатюра файла.
+    // Снимок делаем на UI-потоке (mpv-хэндл не Send), но тяжёлый ресайз/энкод
+    // уводим в фоновый поток, чтобы не фризить интерфейс.
+    {
+        let weak = window.as_weak();
+        let mpv = mpv_opt.clone();
+        let current = current_open_id.clone();
+        let thumbs = paths.thumbnails.clone();
+        window.on_viewer_set_thumbnail(move || {
+            let id = current.get();
+            let Some(mpv) = &mpv else { return };
+            if id < 0 {
+                return;
+            }
+            let dst = thumbs.join(format!("{id}.jpg"));
+            let tmp = thumbs.join(format!("{id}.cap.jpg"));
+            // Быстрый снимок текущего кадра во временный JPEG (энкод одного кадра).
+            if let Err(e) = mpv.screenshot_to_file(&tmp.to_string_lossy()) {
+                log::error!("{e}");
+                return;
+            }
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = crate::workers::make_image_thumb(&tmp, &dst) {
+                    log::error!("Миниатюра из кадра: {e}");
+                }
+                let _ = std::fs::remove_file(&tmp);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.invoke_thumb_updated(id as i32);
+                    }
+                });
+            });
+        });
+    }
+
+    // Фоновая генерация миниатюры завершена — сбрасываем кэш и обновляем плитку.
+    {
+        let thumbs = paths.thumbnails.clone();
+        let thumb_cache = thumb_cache.clone();
+        let rebuild_gallery = rebuild_gallery.clone();
+        window.on_thumb_updated(move |id| {
+            let dst = thumbs.join(format!("{id}.jpg"));
+            thumb_cache
+                .borrow_mut()
+                .remove(&dst.to_string_lossy().into_owned());
+            rebuild_gallery();
         });
     }
 

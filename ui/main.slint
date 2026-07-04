@@ -170,6 +170,10 @@ export component MainWindow inherits Window {
     callback add-tag-edited(string);
     callback add-tag-commit(string);
     callback pick-add-suggestion(string);
+    // Сделать текущий кадр видео миниатюрой файла
+    callback viewer-set-thumbnail();
+    // Внутренний: фоновая генерация миниатюры завершена (id файла)
+    callback thumb-updated(int);
 
     property <bool> video-mode: root.viewer-open && root.viewer-is-video;
 
@@ -1101,6 +1105,26 @@ export component MainWindow inherits Window {
                             clicked => { root.pick-add-suggestion(s); }
                         }
                     }
+                }
+            }
+
+            // Справа: сделать текущий кадр видео миниатюрой файла.
+            if root.viewer-is-video: Rectangle {
+                x: parent.width - self.width - 8px;
+                y: 8px;
+                width: 156px;
+                height: 30px;
+                border-radius: 6px;
+                background: sett-ta.has-hover ? #3a3a48 : #2a2a32;
+                Text {
+                    text: "Set as thumbnail";
+                    color: #e6e6e6;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                sett-ta := TouchArea {
+                    clicked => { root.viewer-set-thumbnail(); }
                 }
             }
         }

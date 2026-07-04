@@ -447,6 +447,20 @@ impl Mpv {
         self.set_double("video-pan-y", y);
     }
 
+    /// Сохраняет текущий кадр видео в файл (без OSD/субтитров, в разрешении
+    /// видео). Формат — по расширению пути. Команда синхронная.
+    pub fn screenshot_to_file(&self, path: &str) -> Result<(), String> {
+        let cmd = cstr("screenshot-to-file");
+        let file = CString::new(path).map_err(|_| "путь содержит NUL".to_string())?;
+        let flag = cstr("video");
+        let args: [*const c_char; 4] = [cmd.as_ptr(), file.as_ptr(), flag.as_ptr(), ptr::null()];
+        let ret = unsafe { (self.command)(self.handle, args.as_ptr()) };
+        if ret < 0 {
+            return Err(format!("screenshot-to-file('{path}') -> {ret}"));
+        }
+        Ok(())
+    }
+
     /// Останавливает воспроизведение (выгружает текущий файл).
     pub fn stop(&self) {
         let cmd = cstr("stop");

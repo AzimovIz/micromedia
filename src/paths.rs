@@ -4,9 +4,9 @@
 //! ```text
 //! <binary>
 //! media/          — все медиа; отсюда индексация, сюда импорт
-//! thumbnails/     — миниатюры {file_id}.jpg
 //! appdata/
 //!   micromedia.db
+//!   thumbnails/   — миниатюры {file_id}.jpg
 //!   libs/         — libmpv.so / libmpv-2.dll
 //!   config.toml
 //! ```
@@ -29,7 +29,7 @@ impl Paths {
         let appdata = base.join("appdata");
         Paths {
             media: base.join("media"),
-            thumbnails: base.join("thumbnails"),
+            thumbnails: appdata.join("thumbnails"),
             libs: appdata.join("libs"),
             db: appdata.join("micromedia.db"),
             config: appdata.join("config.toml"),
