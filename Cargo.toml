@@ -13,6 +13,16 @@ slint = { version = "1", default-features = false, features = [
 libloading = "0.8"
 log = "0.4"
 env_logger = "0.11"
+rusqlite = { version = "0.31", features = ["bundled"] }
+walkdir = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+    "bmp",
+] }
 
 [build-dependencies]
 slint-build = "1"

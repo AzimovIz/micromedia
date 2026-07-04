@@ -1,2 +1,7 @@
 /target
 Cargo.lock
+
+# Рантайм-данные приложения (создаются рядом с бинарником / в dev — в корне)
+/appdata
+/media
+/thumbnails

@@ -57,7 +57,13 @@ type FnInitialize = unsafe extern "C" fn(*mut MpvHandle) -> c_int;
 type FnTerminateDestroy = unsafe extern "C" fn(*mut MpvHandle);
 type FnSetOptionString = unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int;
 type FnSetPropertyString = unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int;
+type FnGetProperty = unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int;
+type FnSetProperty = unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int;
 type FnCommand = unsafe extern "C" fn(*mut MpvHandle, *const *const c_char) -> c_int;
+
+// Форматы свойств (client.h)
+const MPV_FORMAT_FLAG: c_int = 3;
+const MPV_FORMAT_DOUBLE: c_int = 5;
 
 type FnRenderContextCreate =
     unsafe extern "C" fn(*mut *mut MpvRenderContext, *mut MpvHandle, *mut MpvRenderParam) -> c_int;
@@ -89,6 +95,8 @@ pub struct Mpv {
     terminate_destroy: FnTerminateDestroy,
     set_option_string: FnSetOptionString,
     set_property_string: FnSetPropertyString,
+    get_property: FnGetProperty,
+    set_property: FnSetProperty,
     command: FnCommand,
 
     render_context_create: FnRenderContextCreate,
@@ -128,6 +136,8 @@ impl Mpv {
             let set_option_string: FnSetOptionString = sym(&lib, b"mpv_set_option_string\0")?;
             let set_property_string: FnSetPropertyString =
                 sym(&lib, b"mpv_set_property_string\0")?;
+            let get_property: FnGetProperty = sym(&lib, b"mpv_get_property\0")?;
+            let set_property: FnSetProperty = sym(&lib, b"mpv_set_property\0")?;
             let command: FnCommand = sym(&lib, b"mpv_command\0")?;
             let render_context_create: FnRenderContextCreate =
                 sym(&lib, b"mpv_render_context_create\0")?;
@@ -153,6 +163,8 @@ impl Mpv {
                 terminate_destroy,
                 set_option_string,
                 set_property_string,
+                get_property,
+                set_property,
                 command,
                 render_context_create,
                 render_context_render,
@@ -166,6 +178,14 @@ impl Mpv {
             mpv.set_option("terminal", "no");
             mpv.set_option("msg-level", "all=warn");
             mpv.set_option("keep-open", "yes");
+            // Демукс-кэш в RAM: по умолчанию mpv кэширует только сетевые потоки,
+            // а локальные файлы читает напрямую — на медленной флешке это даёт
+            // фризы. Форсируем кэш и упреждающее чтение, чтобы отвязать
+            // воспроизведение от задержек диска.
+            mpv.set_option("cache", "yes");
+            mpv.set_option("demuxer-max-bytes", "128MiB");
+            mpv.set_option("demuxer-max-back-bytes", "64MiB");
+            mpv.set_option("demuxer-readahead-secs", "20");
             // hwdec: на Windows с нативным WGL прямой интероп D3D11<->GL даёт
             // зелёные артефакты. Безопасный дефолт — без hwdec (софт-декод);
             // можно переопределить через env (например MICROMEDIA_HWDEC=auto-copy,
@@ -299,6 +319,143 @@ impl Mpv {
         Ok(())
     }
 
+    /// Читает свойство типа double (например time-pos, duration).
+    pub fn get_double(&self, name: &str) -> Option<f64> {
+        let n = cstr(name);
+        let mut val: f64 = 0.0;
+        let r = unsafe {
+            (self.get_property)(
+                self.handle,
+                n.as_ptr(),
+                MPV_FORMAT_DOUBLE,
+                &mut val as *mut f64 as *mut c_void,
+            )
+        };
+        if r < 0 {
+            None
+        } else {
+            Some(val)
+        }
+    }
+
+    /// Устанавливает свойство типа double (например time-pos для перемотки).
+    pub fn set_double(&self, name: &str, v: f64) {
+        let n = cstr(name);
+        let mut val = v;
+        unsafe {
+            (self.set_property)(
+                self.handle,
+                n.as_ptr(),
+                MPV_FORMAT_DOUBLE,
+                &mut val as *mut f64 as *mut c_void,
+            );
+        }
+    }
+
+    /// Читает булево свойство (например pause).
+    pub fn get_flag(&self, name: &str) -> Option<bool> {
+        let n = cstr(name);
+        let mut val: c_int = 0;
+        let r = unsafe {
+            (self.get_property)(
+                self.handle,
+                n.as_ptr(),
+                MPV_FORMAT_FLAG,
+                &mut val as *mut c_int as *mut c_void,
+            )
+        };
+        if r < 0 {
+            None
+        } else {
+            Some(val != 0)
+        }
+    }
+
+    /// Устанавливает булево свойство (например pause, mute).
+    pub fn set_flag(&self, name: &str, v: bool) {
+        let n = cstr(name);
+        let mut val: c_int = if v { 1 } else { 0 };
+        unsafe {
+            (self.set_property)(
+                self.handle,
+                n.as_ptr(),
+                MPV_FORMAT_FLAG,
+                &mut val as *mut c_int as *mut c_void,
+            );
+        }
+    }
+
+    /// Устанавливает строковое свойство (например loop-file).
+    pub fn set_property_str(&self, name: &str, value: &str) {
+        let (n, v) = (cstr(name), cstr(value));
+        let ret = unsafe { (self.set_property_string)(self.handle, n.as_ptr(), v.as_ptr()) };
+        if ret < 0 {
+            log::warn!("mpv set_property {name}={value} -> {ret}");
+        }
+    }
+
+    /// Выполняет команду mpv с произвольными строковыми аргументами.
+    fn command_v(&self, args: &[&str]) {
+        let cs: Vec<CString> = args.iter().filter_map(|a| CString::new(*a).ok()).collect();
+        let mut ptrs: Vec<*const c_char> = cs.iter().map(|c| c.as_ptr()).collect();
+        ptrs.push(ptr::null());
+        let ret = unsafe { (self.command)(self.handle, ptrs.as_ptr()) };
+        if ret < 0 {
+            log::warn!("mpv command {args:?} -> {ret}");
+        }
+    }
+
+    /// Относительная перемотка на `secs` секунд (может быть отрицательной).
+    pub fn seek_relative(&self, secs: f64) {
+        self.command_v(&["seek", &secs.to_string(), "relative"]);
+    }
+
+    /// Шаг на кадр вперёд/назад (ставит на паузу).
+    pub fn frame_step(&self, forward: bool) {
+        self.command_v(&[if forward { "frame-step" } else { "frame-back-step" }]);
+    }
+
+    /// Скорость воспроизведения (0.5..2.0 и т.п.).
+    pub fn set_speed(&self, v: f64) {
+        self.set_double("speed", v);
+    }
+
+    /// Громкость 0..100.
+    pub fn set_volume(&self, v: f64) {
+        self.set_double("volume", v);
+    }
+
+    /// Луп текущего файла.
+    pub fn set_loop(&self, on: bool) {
+        self.set_property_str("loop-file", if on { "inf" } else { "no" });
+    }
+
+    /// Явная пауза (в отличие от cycle).
+    pub fn set_pause(&self, paused: bool) {
+        self.set_flag("pause", paused);
+    }
+
+    /// Масштаб видео (линейный: 1.0 = норма). mpv `video-zoom` — в степенях двойки.
+    pub fn set_video_zoom(&self, linear: f64) {
+        let z = if linear > 0.0 { linear.log2() } else { 0.0 };
+        self.set_double("video-zoom", z);
+    }
+
+    /// Панорама видео как доля окна (x/y ≈ -1..1).
+    pub fn set_video_pan(&self, x: f64, y: f64) {
+        self.set_double("video-pan-x", x);
+        self.set_double("video-pan-y", y);
+    }
+
+    /// Останавливает воспроизведение (выгружает текущий файл).
+    pub fn stop(&self) {
+        let cmd = cstr("stop");
+        let args: [*const c_char; 2] = [cmd.as_ptr(), ptr::null()];
+        unsafe {
+            (self.command)(self.handle, args.as_ptr());
+        }
+    }
+
     /// Переключение паузы (для проверки командного канала).
     pub fn toggle_pause(&self) {
         // читаем текущее значение? проще — командой cycle
@@ -329,7 +486,7 @@ const LIB_NAMES: &[&str] = &["libmpv-2.dll", "mpv-2.dll", "libmpv.dll", "mpv-1.d
 const LIB_NAMES: &[&str] = &["libmpv.so", "libmpv.so.2", "libmpv.so.1"];
 
 /// Ищет libmpv в приоритетном порядке каталогов рядом с бинарником и в CWD.
-fn find_libmpv() -> Option<PathBuf> {
+pub(crate) fn find_libmpv() -> Option<PathBuf> {
     // Явный оверрайд для отладки.
     if let Ok(p) = std::env::var("MICROMEDIA_MPV") {
         let p = PathBuf::from(p);

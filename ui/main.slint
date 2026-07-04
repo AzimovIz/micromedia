@@ -1,49 +1,1181 @@
-// Milestone B: под этим UI mpv рисует видео (подложка через render API).
-// Фон окна прозрачный — Slint рисует поверх видео.
+// Галерея + оверлей-просмотрщик.
+//
+// Слои (z-order): непрозрачная подложка → галерея → просмотрщик.
+// Для видео подложка/галерея скрываются, фон окна прозрачный — тогда сквозь
+// UI проступает видео, которое mpv рисует render API (см. main.rs).
+
+import { Slider, LineEdit, ComboBox, ListView } from "std-widgets.slint";
+
+export struct FileItem {
+    id: int,
+    name: string,
+    thumb-path: string,
+    is-video: bool,
+}
+
+export struct TagItem {
+    id: int,
+    name: string,
+}
+
+export struct TreeRow {
+    label: string,
+    depth: int,
+    is-folder: bool,
+    is-video: bool,
+    expanded: bool,
+    sel-state: int, // 0 нет, 1 полн., 2 частич.
+}
+
+// Компактная иконочная кнопка для панели плеера.
+component CtrlBtn inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    in property <length> fsize: 17px;
+    in property <length> w: 38px;
+    callback clicked;
+    width: root.w;
+    height: 40px;
+    border-radius: 6px;
+    background: ta.has-hover ? #ffffff22 : (root.active ? #ffffff20 : transparent);
+    Text {
+        text: root.label;
+        color: white;
+        font-size: root.fsize;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
 
 export component MainWindow inherits Window {
     preferred-width: 1280px;
-    preferred-height: 720px;
-    title: "MicroMedia — prototype";
+    preferred-height: 800px;
+    title: "MicroMedia";
     background: transparent;
 
-    in property <string> status: "…";
-    callback toggle-play();
+    // --- Галерея ---
+    in property <[FileItem]> files;
+    in property <int> file-count: 0;
+    in-out property <float> cols-slider: 6;
+    property <int> columns: Math.max(1, Math.round(root.cols-slider));
+    property <length> gap: 8px;
+    property <length> cell-size: (flick.width - root.gap * (root.columns + 1)) / root.columns;
 
-    // Нижняя панель управления
-    VerticalLayout {
-        alignment: end;
+    pure callback load-thumb(string) -> image;
+    callback open-file(int);
+    callback refresh();
+    callback rescan-done(); // внутренний: скан завершён → пересобрать UI
+
+    // Сортировка (пункты задаёт Rust; индекс → ключ сортировки в БД)
+    in property <[string]> sort-options;
+    in-out property <int> sort-index: 0;
+    callback sort-changed();
+
+    // Вид: 0 — плитка, 1 — список (дерево)
+    in-out property <int> view-mode: 0;
+    in property <[TreeRow]> tree-rows;
+    in property <int> selected-count: 0;
+    callback tree-clicked(int);
+    callback tree-double(int);
+    callback tree-expand(int);
+
+    // ПКМ-меню над строкой списка (idx — индекс строки дерева)
+    callback ctx-add-tags(int);
+    callback ctx-remove-tags(int);
+    callback ctx-delete(int);
+    callback ctx-open-location(int);
+
+    // Панель массового тегирования (add/remove); title содержит режим+счётчик
+    in-out property <bool> bulk-tag-open: false;
+    in property <string> bulk-tag-title;
+    in-out property <string> bulk-tag-text;
+    in property <[string]> bulk-tag-suggestions;
+    callback bulk-tag-edited(string);
+    callback bulk-tag-pick(string);
+    callback bulk-tag-commit(string);
+    callback bulk-tag-cancel();
+
+    // Подтверждение безвозвратного удаления с диска
+    in-out property <bool> confirm-delete-open: false;
+    in property <string> confirm-delete-text;
+    callback confirm-delete-ok();
+    callback confirm-delete-cancel();
+
+    // --- Фильтр по тегам (строка "tag1 -tag2 tag3") ---
+    in-out property <string> filter-text;
+    in property <[string]> filter-suggestions;
+    callback filter-edited(string);
+    callback pick-filter-suggestion(string);
+    // Действия из контекстного меню тега (ПКМ по чипу в просмотрщике)
+    callback filter-add-include(string);
+    callback filter-add-exclude(string);
+    callback filter-remove(string);
+
+    // Поиск по имени файла + фильтр по типу (0 все, 1 фото, 2 видео)
+    in-out property <string> search-text;
+    in-out property <int> type-filter: 0;
+    callback search-changed();
+
+    // --- Просмотрщик ---
+    in property <bool> viewer-open: false;
+    in property <bool> viewer-is-video: false;
+    in property <image> viewer-image;
+    in property <string> viewer-name;
+    in property <bool> viewer-paused: false;
+    in-out property <float> viewer-pos: 0;
+    in property <float> viewer-duration: 0;
+
+    callback viewer-close();
+    callback viewer-toggle-play();
+    callback viewer-seek(float);
+
+    // Расширенные контролы видео
+    in-out property <float> viewer-volume: 100;
+    in property <bool> viewer-muted: false;
+    in property <float> viewer-speed: 1.0;
+    in property <bool> viewer-loop: false;
+    in property <bool> viewer-fullscreen: false;
+    in property <string> viewer-time-text;     // "1:05 / 3:42" (готовит Rust)
+    in property <bool> viewer-controls-visible: true;
+    callback viewer-skip(float);               // относительная перемотка, сек
+    callback viewer-frame-step(int);           // +1 / -1 кадр
+    callback viewer-set-volume(float);
+    callback viewer-toggle-mute();
+    callback viewer-cycle-speed();
+    callback viewer-toggle-loop();
+    callback viewer-toggle-fullscreen();
+    callback viewer-activity();                // движение мыши — сброс авто-скрытия
+
+    // Зум/панорама (общие для фото и видео; для видео Rust транслирует в mpv)
+    in-out property <float> viewer-zoom: 1.0;
+    in-out property <float> viewer-pan-x: 0;   // доля ширины вьюпорта
+    in-out property <float> viewer-pan-y: 0;   // доля высоты вьюпорта
+    callback viewer-transform-changed();       // применить зум/пан (для видео)
+
+    // Теги открытого файла (назначенные) + добавление с автодополнением.
+    in property <[TagItem]> viewer-tags;
+    in-out property <string> add-tag-text;
+    in property <[string]> add-tag-suggestions;
+    callback toggle-file-tag(int);
+    callback add-tag-edited(string);
+    callback add-tag-commit(string);
+    callback pick-add-suggestion(string);
+
+    property <bool> video-mode: root.viewer-open && root.viewer-is-video;
+
+    // Подложка (непрозрачная). Прячется только в режиме видео.
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #16161a;
+        visible: !root.video-mode;
+    }
+
+    // --- Слой галереи ---
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        visible: !root.viewer-open;
+
+        HorizontalLayout {
+
+        // Боковая панель: строковый фильтр тегов + автоподсказки
         Rectangle {
-            height: 56px;
-            background: #101014e6;
-            HorizontalLayout {
+            width: 230px;
+            background: #191920;
+            VerticalLayout {
                 padding: 10px;
-                spacing: 12px;
-                alignment: start;
+                spacing: 6px;
 
-                play-btn := Rectangle {
-                    width: 96px;
-                    background: touch.pressed ? #3a3a44 : (touch.has-hover ? #2a2a32 : #1d1d24);
-                    border-radius: 8px;
+                // Поиск по имени файла
+                Text {
+                    text: "Поиск по имени";
+                    color: #e6e6e6;
+                    font-size: 15px;
+                }
+                LineEdit {
+                    placeholder-text: "Имя файла...";
+                    opacity: root.search-text == "" ? 0.5 : 1.0;
+                    text <=> root.search-text;
+                    edited => { root.search-changed(); }
+                }
+
+                // Фильтр по типу медиа
+                HorizontalLayout {
+                    spacing: 4px;
+                    height: 28px;
+                    for opt[i] in ["Все", "Фото", "Видео"]: Rectangle {
+                        border-radius: 4px;
+                        background: root.type-filter == i ? #3a3a48
+                            : (tf-ta.has-hover ? #2a2a32 : #202028);
+                        Text {
+                            text: opt;
+                            color: #dddddd;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        tf-ta := TouchArea {
+                            clicked => { root.type-filter = i; root.search-changed(); }
+                        }
+                    }
+                }
+
+                Rectangle { height: 6px; }
+
+                Text {
+                    text: "Фильтр по тегам";
+                    color: #e6e6e6;
+                    font-size: 15px;
+                }
+                LineEdit {
+                    placeholder-text: "Tag search...";
+                    // приглушаем, пока поле пустое (виден плейсхолдер)
+                    opacity: root.filter-text == "" ? 0.5 : 1.0;
+                    text <=> root.filter-text;
+                    edited(t) => { root.filter-edited(t); }
+                }
+                Text {
+                    text: "«-tag» исключает";
+                    color: #6f6f7a;
+                    font-size: 11px;
+                }
+
+                // Подсказки существующих тегов
+                for s in root.filter-suggestions: Rectangle {
+                    height: 26px;
+                    background: fsug-ta.has-hover ? #2f2f3a : #202028;
+                    border-radius: 4px;
                     Text {
-                        text: "⏯  Play/Pause";
-                        color: #e6e6e6;
+                        x: 8px;
+                        width: parent.width - 16px;
+                        text: s;
+                        color: #dddddd;
                         font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    fsug-ta := TouchArea {
+                        clicked => { root.pick-filter-suggestion(s); }
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+            }
+        }
+
+        // Основная колонка
+        VerticalLayout {
+            Rectangle {
+                height: 48px;
+                background: #1e1e24;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 12px;
+
+                    Text {
+                        text: "MicroMedia — " + root.file-count + " файлов"
+                            + (root.selected-count > 0 ? "  ·  выбрано " + root.selected-count : "");
+                        color: #e6e6e6;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+
+                    // Переключатель вида
+                    tile-btn := Rectangle {
+                        width: 66px;
+                        background: root.view-mode == 0 ? #3a3a48 : (tbt.has-hover ? #2a2a32 : transparent);
+                        border-radius: 6px;
+                        Text {
+                            text: "Плитка";
+                            color: #e6e6e6;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        tbt := TouchArea { clicked => { root.view-mode = 0; } }
+                    }
+                    list-btn := Rectangle {
+                        width: 66px;
+                        background: root.view-mode == 1 ? #3a3a48 : (lbt.has-hover ? #2a2a32 : transparent);
+                        border-radius: 6px;
+                        Text {
+                            text: "Список";
+                            color: #e6e6e6;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        lbt := TouchArea { clicked => { root.view-mode = 1; } }
+                    }
+
+                    ComboBox {
+                        width: 190px;
+                        model: root.sort-options;
+                        current-index <=> root.sort-index;
+                        selected(v) => { root.sort-changed(); }
+                    }
+                    Text {
+                        text: "Колонки";
+                        color: #b8b8c0;
+                        vertical-alignment: center;
+                    }
+                    Slider {
+                        width: 160px;
+                        minimum: 2;
+                        maximum: 12;
+                        value <=> root.cols-slider;
+                    }
+                    refresh-btn := Rectangle {
+                        width: 40px;
+                        background: rb-ta.has-hover ? #2a2a32 : transparent;
+                        border-radius: 6px;
+                        Text {
+                            text: "⟳";
+                            color: #e6e6e6;
+                            font-size: 18px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        rb-ta := TouchArea {
+                            clicked => { root.refresh(); }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+
+                flick := Flickable {
+                visible: root.view-mode == 0;
+                width: 100%;
+                height: 100%;
+                viewport-width: self.width;
+                viewport-height: Math.ceil(root.files.length / root.columns) * (root.cell-size + root.gap) + root.gap;
+
+                for item[idx] in root.files: Rectangle {
+                    property <int> cell-row: Math.floor(idx / root.columns);
+                    x: root.gap + (idx - self.cell-row * root.columns) * (root.cell-size + root.gap);
+                    y: root.gap + self.cell-row * (root.cell-size + root.gap);
+                    width: root.cell-size;
+                    height: root.cell-size;
+                    background: cell-ta.has-hover ? #30303a : #26262e;
+                    border-radius: 6px;
+                    clip: true;
+
+                    Image {
+                        width: 100%;
+                        height: 100%;
+                        image-fit: cover;
+                        source: root.load-thumb(item.thumb-path);
+                    }
+                    if item.is-video: Text {
+                        width: 100%;
+                        height: 100%;
+                        text: "▶";
+                        color: #ffffffcc;
+                        font-size: 34px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
-                    touch := TouchArea {
-                        clicked => { root.toggle-play(); }
+                    if cell-ta.has-hover: Rectangle {
+                        y: parent.height - 22px;
+                        height: 22px;
+                        background: #000000aa;
+                        Text {
+                            x: 5px;
+                            width: parent.width - 10px;
+                            text: item.name;
+                            color: white;
+                            font-size: 11px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                    }
+                    cell-ta := TouchArea {
+                        clicked => { root.open-file(item.id); }
+                    }
+                }
+                }
+
+                // Вид «Список» (дерево)
+                tree-list := ListView {
+                    visible: root.view-mode == 1;
+                    width: 100%;
+                    height: 100%;
+                    for row[idx] in root.tree-rows: Rectangle {
+                        height: 26px;
+                        background: row.sel-state == 1 ? #24343f : (rowta.has-hover ? #23232b : transparent);
+                        HorizontalLayout {
+                            padding-left: row.depth * 16px + 6px;
+                            padding-right: 8px;
+                            spacing: 4px;
+                            Text {
+                                width: 14px;
+                                text: row.is-folder ? (row.expanded ? "▾" : "▸") : "";
+                                color: #9a9aa5;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                width: 18px;
+                                text: row.sel-state == 1 ? "☑" : (row.sel-state == 2 ? "◪" : "☐");
+                                color: row.sel-state == 0 ? #7a7a85 : #6ab0d0;
+                                font-size: 14px;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: (row.is-folder ? "" : (row.is-video ? "▶ " : "")) + row.label;
+                                color: row.is-folder ? #dfe6c0 : #dddddd;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        rowta := TouchArea {
+                            clicked => { root.tree-clicked(idx); }
+                            double-clicked => { root.tree-double(idx); }
+                            pointer-event(event) => {
+                                if (event.button == PointerEventButton.right
+                                        && event.kind == PointerEventKind.down) {
+                                    ctx-popup.show();
+                                }
+                            }
+                        }
+                        // Отдельная зона над треугольником: клик по нему у папки
+                        // раскрывает/сворачивает (поверх rowta, поэтому не выделяет).
+                        if row.is-folder : TouchArea {
+                            x: row.depth * 16px + 4px;
+                            width: 16px;
+                            y: 0;
+                            height: 100%;
+                            clicked => { root.tree-expand(idx); }
+                        }
+
+                        // Контекстное меню у курсора. «Открыть расположение»
+                        // показываем, только если строка не выделена целиком.
+                        ctx-popup := PopupWindow {
+                            x: rowta.mouse-x;
+                            y: rowta.mouse-y;
+                            width: 210px;
+                            height: (row.sel-state != 1 ? 4 : 3) * 30px + 8px;
+                            close-policy: close-on-click-outside;
+                            Rectangle {
+                                background: #2a2a32;
+                                border-radius: 6px;
+                                border-width: 1px;
+                                border-color: #4a4a54;
+                                VerticalLayout {
+                                    padding: 4px;
+                                    spacing: 2px;
+                                    Rectangle {
+                                        height: 28px;
+                                        background: cm1.has-hover ? #3a3a44 : transparent;
+                                        border-radius: 4px;
+                                        Text {
+                                            x: 10px;
+                                            text: "Добавить теги";
+                                            color: #dddddd;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                        cm1 := TouchArea {
+                                            clicked => { root.ctx-add-tags(idx); ctx-popup.close(); }
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 28px;
+                                        background: cm2.has-hover ? #3a3a44 : transparent;
+                                        border-radius: 4px;
+                                        Text {
+                                            x: 10px;
+                                            text: "Удалить теги";
+                                            color: #dddddd;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                        cm2 := TouchArea {
+                                            clicked => { root.ctx-remove-tags(idx); ctx-popup.close(); }
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 28px;
+                                        background: cm3.has-hover ? #4a2a2a : transparent;
+                                        border-radius: 4px;
+                                        Text {
+                                            x: 10px;
+                                            text: row.sel-state == 1 ? "Удалить выбранное" : "Удалить";
+                                            color: #ecc0c0;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                        cm3 := TouchArea {
+                                            clicked => { root.ctx-delete(idx); ctx-popup.close(); }
+                                        }
+                                    }
+                                    if row.sel-state != 1 : Rectangle {
+                                        height: 28px;
+                                        background: cm4.has-hover ? #3a3a44 : transparent;
+                                        border-radius: 4px;
+                                        Text {
+                                            x: 10px;
+                                            text: "Открыть расположение";
+                                            color: #dddddd;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                        cm4 := TouchArea {
+                                            clicked => { root.ctx-open-location(idx); ctx-popup.close(); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        }
+
+        // --- Оверлей: массовое тегирование ---
+        if root.bulk-tag-open : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #00000088;
+            // Клик по затемнению — отмена.
+            TouchArea { clicked => { root.bulk-tag-cancel(); } }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 340px;
+                height: 250px;
+                background: #23232b;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #4a4a54;
+                // Поглощает клики внутри карточки.
+                TouchArea { }
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+                    Text {
+                        text: root.bulk-tag-title;
+                        color: #e6e6e6;
+                        font-size: 15px;
+                    }
+                    bulk-edit := LineEdit {
+                        placeholder-text: "тег";
+                        text <=> root.bulk-tag-text;
+                        edited(t) => { root.bulk-tag-edited(t); }
+                        accepted(t) => { root.bulk-tag-commit(t); }
+                    }
+                    Rectangle {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            spacing: 2px;
+                            alignment: start;
+                            for s in root.bulk-tag-suggestions: Rectangle {
+                                height: 26px;
+                                background: bsug.has-hover ? #2f2f3a : #202028;
+                                border-radius: 4px;
+                                Text {
+                                    x: 8px;
+                                    width: parent.width - 16px;
+                                    text: s;
+                                    color: #dddddd;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                bsug := TouchArea {
+                                    clicked => { root.bulk-tag-pick(s); }
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle {
+                            height: 30px;
+                            background: bcancel.has-hover ? #3a3a44 : #303038;
+                            border-radius: 5px;
+                            Text {
+                                text: "Отмена";
+                                color: #dddddd;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            bcancel := TouchArea {
+                                clicked => { root.bulk-tag-cancel(); }
+                            }
+                        }
+                        Rectangle {
+                            height: 30px;
+                            background: bok.has-hover ? #2e7d32 : #276a2b;
+                            border-radius: 5px;
+                            Text {
+                                text: "Применить";
+                                color: white;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            bok := TouchArea {
+                                clicked => { root.bulk-tag-commit(root.bulk-tag-text); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Оверлей: подтверждение удаления с диска ---
+        if root.confirm-delete-open : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000aa;
+            TouchArea { clicked => { root.confirm-delete-cancel(); } }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 360px;
+                height: 140px;
+                background: #23232b;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #6a3a3a;
+                TouchArea { }
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 14px;
+                    Text {
+                        text: root.confirm-delete-text;
+                        color: #ecc0c0;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        vertical-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle {
+                            height: 32px;
+                            background: dcancel.has-hover ? #3a3a44 : #303038;
+                            border-radius: 5px;
+                            Text {
+                                text: "Отмена";
+                                color: #dddddd;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            dcancel := TouchArea {
+                                clicked => { root.confirm-delete-cancel(); }
+                            }
+                        }
+                        Rectangle {
+                            height: 32px;
+                            background: dok.has-hover ? #c0392b : #a03028;
+                            border-radius: 5px;
+                            Text {
+                                text: "Удалить";
+                                color: white;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            dok := TouchArea {
+                                clicked => { root.confirm-delete-ok(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Слой просмотрщика ---
+    if root.viewer-open: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.viewer-is-video ? transparent : #0b0b0d;
+
+        // Зумируемое изображение (в клип-контейнере)
+        if !root.viewer-is-video: Rectangle {
+            width: 100%;
+            height: 100%;
+            clip: true;
+            Image {
+                width: parent.width * root.viewer-zoom;
+                height: parent.height * root.viewer-zoom;
+                x: (parent.width - self.width) / 2 + root.viewer-pan-x * parent.width;
+                y: (parent.height - self.height) / 2 + root.viewer-pan-y * parent.height;
+                image-fit: contain;
+                source: root.viewer-image;
+            }
+        }
+
+        // Единый инпут: колесо — зум, ЛКМ-перетаскивание — панорама (при зуме),
+        // одиночный ЛКМ по видео — пауза, СКМ — сброс зума. Под контролами по
+        // z-order (объявлен раньше нижней/верхней панелей).
+        zoom-ta := TouchArea {
+            width: 100%;
+            height: 100%;
+            property <bool> dragging: false;
+            property <float> px-start;
+            property <float> py-start;
+
+            scroll-event(e) => {
+                root.viewer-zoom = Math.clamp(
+                    root.viewer-zoom * (e.delta-y > 0 ? 1.1 : 0.9), 1.0, 8.0);
+                if (root.viewer-zoom <= 1.0) {
+                    root.viewer-pan-x = 0;
+                    root.viewer-pan-y = 0;
+                }
+                root.viewer-transform-changed();
+                root.viewer-activity();
+                return accept;
+            }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    if (e.button == PointerEventButton.middle) {
+                        root.viewer-zoom = 1.0;
+                        root.viewer-pan-x = 0;
+                        root.viewer-pan-y = 0;
+                        root.viewer-transform-changed();
+                    } else if (e.button == PointerEventButton.left) {
+                        self.dragging = false;
+                        self.px-start = root.viewer-pan-x;
+                        self.py-start = root.viewer-pan-y;
+                    }
+                    root.viewer-activity();
+                }
+                if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                    if (!self.dragging && root.viewer-is-video) {
+                        root.viewer-toggle-play();
+                    }
+                    key-fs.focus();
+                }
+            }
+            // Двойной клик по видео — на весь экран (как кнопка ⛶).
+            double-clicked => {
+                if (root.viewer-is-video) {
+                    root.viewer-toggle-fullscreen();
+                }
+            }
+            // Порог клик/перетаскивание и панораму считаем от pressed-x/pressed-y,
+            // которые Slint выставляет по реальной точке нажатия (иначе первое
+            // событие после ползунка ловит устаревший mouse-x).
+            moved => {
+                if (self.pressed) {
+                    if (Math.abs(self.mouse-x - self.pressed-x) > 3px
+                            || Math.abs(self.mouse-y - self.pressed-y) > 3px) {
+                        self.dragging = true;
+                    }
+                    if (root.viewer-zoom > 1.0) {
+                        root.viewer-pan-x = self.px-start + (self.mouse-x - self.pressed-x) / self.width;
+                        root.viewer-pan-y = self.py-start + (self.mouse-y - self.pressed-y) / self.height;
+                        root.viewer-transform-changed();
+                    }
+                }
+                root.viewer-activity();
+            }
+        }
+
+        // Полоса тегов файла: назначенные чипы + поле добавления
+        Rectangle {
+            y: 0;
+            height: 46px;
+            width: 100%;
+            background: #000000bb;
+            visible: root.viewer-controls-visible;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 6px;
+                alignment: start;
+
+                for t in root.viewer-tags: Rectangle {
+                    background: #2e7d32;
+                    border-radius: 8px;
+
+                    // Поглощает клики по чипу (не проваливаются на видео);
+                    // ПКМ — контекстное меню действий над фильтром.
+                    chip-bg := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { }
+                        pointer-event(event) => {
+                            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                menu-popup.show();
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 6px;
+                        spacing: 6px;
+                        Text {
+                            text: t.name;
+                            color: white;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        // Крестик — удаление только по нему (с подтверждением)
+                        Rectangle {
+                            width: 18px;
+                            Text {
+                                text: "✕";
+                                color: xta.has-hover ? #ffd0d0 : #ffffffbb;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            xta := TouchArea {
+                                clicked => { confirm-popup.show(); }
+                            }
+                        }
+                    }
+
+                    // Подтверждение под тегом; клик вне окна = отмена.
+                    confirm-popup := PopupWindow {
+                        x: 0px;
+                        y: parent.height + 3px;
+                        width: 148px;
+                        height: 62px;
+                        close-policy: close-on-click-outside;
+                        Rectangle {
+                            background: #2a2a32;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #4a4a54;
+                            VerticalLayout {
+                                padding: 8px;
+                                spacing: 6px;
+                                Text {
+                                    text: "Удалить тег?";
+                                    color: #e6e6e6;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Rectangle {
+                                        height: 24px;
+                                        background: cta.has-hover ? #3a3a44 : #303038;
+                                        border-radius: 4px;
+                                        Text {
+                                            text: "Cancel";
+                                            color: #dddddd;
+                                            font-size: 12px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        cta := TouchArea {
+                                            clicked => { confirm-popup.close(); }
+                                        }
+                                    }
+                                    Rectangle {
+                                        height: 24px;
+                                        background: ota.has-hover ? #c0392b : #a03028;
+                                        border-radius: 4px;
+                                        Text {
+                                            text: "Ok";
+                                            color: white;
+                                            font-size: 12px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        ota := TouchArea {
+                                            clicked => {
+                                                root.toggle-file-tag(t.id);
+                                                confirm-popup.close();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ПКМ-меню: действия над строкой фильтра
+                    menu-popup := PopupWindow {
+                        x: 0px;
+                        y: parent.height + 3px;
+                        width: 190px;
+                        height: 96px;
+                        close-policy: close-on-click-outside;
+                        Rectangle {
+                            background: #2a2a32;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #4a4a54;
+                            VerticalLayout {
+                                padding: 4px;
+                                spacing: 2px;
+                                Rectangle {
+                                    height: 28px;
+                                    background: mi1.has-hover ? #3a3a44 : transparent;
+                                    border-radius: 4px;
+                                    Text {
+                                        x: 10px;
+                                        text: "Добавить в фильтр";
+                                        color: #dddddd;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    mi1 := TouchArea {
+                                        clicked => { root.filter-add-include(t.name); menu-popup.close(); }
+                                    }
+                                }
+                                Rectangle {
+                                    height: 28px;
+                                    background: mi2.has-hover ? #3a3a44 : transparent;
+                                    border-radius: 4px;
+                                    Text {
+                                        x: 10px;
+                                        text: "Добавить в исключение";
+                                        color: #dddddd;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    mi2 := TouchArea {
+                                        clicked => { root.filter-add-exclude(t.name); menu-popup.close(); }
+                                    }
+                                }
+                                Rectangle {
+                                    height: 28px;
+                                    background: mi3.has-hover ? #3a3a44 : transparent;
+                                    border-radius: 4px;
+                                    Text {
+                                        x: 10px;
+                                        text: "Убрать из поиска";
+                                        color: #dddddd;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    mi3 := TouchArea {
+                                        clicked => { root.filter-remove(t.name); menu-popup.close(); }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
-                Text {
-                    text: root.status;
-                    color: #b8b8c0;
-                    font-size: 13px;
-                    vertical-alignment: center;
+                add-edit := LineEdit {
+                    width: 160px;
+                    placeholder-text: "+ тег";
+                    // приглушаем поле над картинкой, пока оно пустое
+                    opacity: root.add-tag-text == "" ? 0.5 : 1.0;
+                    text <=> root.add-tag-text;
+                    edited(t) => { root.add-tag-edited(t); }
+                    accepted(t) => { root.add-tag-commit(t); }
                 }
             }
+
+            // Выпадающие подсказки под полем (у левого края полосы)
+            if root.add-tag-suggestions.length > 0: Rectangle {
+                x: 8px;
+                y: 46px;
+                width: 200px;
+                height: Math.min(root.add-tag-suggestions.length, 6) * 26px;
+                background: #202028;
+                border-radius: 4px;
+                VerticalLayout {
+                    for s in root.add-tag-suggestions: Rectangle {
+                        height: 26px;
+                        background: asug-ta.has-hover ? #2f2f3a : transparent;
+                        Text {
+                            x: 8px;
+                            width: parent.width - 16px;
+                            text: s;
+                            color: #dddddd;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        asug-ta := TouchArea {
+                            clicked => { root.pick-add-suggestion(s); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Нижняя панель управления
+        Rectangle {
+            y: parent.height - 56px;
+            height: 56px;
+            width: 100%;
+            background: #000000cc;
+            visible: root.viewer-controls-visible;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 4px;
+
+                // --- Видео: полный набор контролов ---
+                if root.viewer-is-video: CtrlBtn {
+                    label: "⏪";
+                    fsize: 15px;
+                    clicked => { root.viewer-skip(-10); }
+                }
+                if root.viewer-is-video: CtrlBtn {
+                    label: "◀5";
+                    fsize: 13px;
+                    clicked => { root.viewer-skip(-5); }
+                }
+                if root.viewer-is-video: CtrlBtn {
+                    label: "⏮";
+                    fsize: 15px;
+                    clicked => { root.viewer-frame-step(-1); }
+                }
+                if root.viewer-is-video: CtrlBtn {
+                    label: root.viewer-paused ? "▶" : "⏸";
+                    fsize: 18px;
+                    w: 44px;
+                    clicked => { root.viewer-toggle-play(); }
+                }
+                if root.viewer-is-video: CtrlBtn {
+                    label: "⏭";
+                    fsize: 15px;
+                    clicked => { root.viewer-frame-step(1); }
+                }
+                if root.viewer-is-video: CtrlBtn {
+                    label: "5▶";
+                    fsize: 13px;
+                    clicked => { root.viewer-skip(5); }
+                }
+                if root.viewer-is-video: CtrlBtn {
+                    label: "⏩";
+                    fsize: 15px;
+                    clicked => { root.viewer-skip(10); }
+                }
+
+                if root.viewer-is-video: Text {
+                    text: root.viewer-time-text;
+                    color: #dddddd;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+
+                if root.viewer-is-video: Slider {
+                    horizontal-stretch: 1;
+                    minimum: 0;
+                    maximum: Math.max(1, root.viewer-duration);
+                    value <=> root.viewer-pos;
+                    changed(v) => { root.viewer-seek(v); }
+                }
+
+                // Скорость
+                if root.viewer-is-video: CtrlBtn {
+                    label: root.viewer-speed + "x";
+                    fsize: 12px;
+                    w: 46px;
+                    clicked => { root.viewer-cycle-speed(); }
+                }
+                // Луп
+                if root.viewer-is-video: CtrlBtn {
+                    label: "🔁";
+                    fsize: 15px;
+                    active: root.viewer-loop;
+                    clicked => { root.viewer-toggle-loop(); }
+                }
+                // Mute
+                if root.viewer-is-video: CtrlBtn {
+                    label: root.viewer-muted ? "🔇" : "🔊";
+                    fsize: 14px;
+                    clicked => { root.viewer-toggle-mute(); }
+                }
+                // Громкость (колесо над ползунком тоже меняет громкость: слайдер
+                // не ловит scroll, поэтому событие всплывает к этой TouchArea).
+                if root.viewer-is-video: TouchArea {
+                    width: 84px;
+                    scroll-event(e) => {
+                        root.viewer-volume = Math.clamp(
+                            root.viewer-volume + (e.delta-y > 0 ? 5 : -5), 0, 100);
+                        root.viewer-set-volume(root.viewer-volume);
+                        return accept;
+                    }
+                    Slider {
+                        width: 100%;
+                        y: (parent.height - self.height) / 2;
+                        minimum: 0;
+                        maximum: 100;
+                        value <=> root.viewer-volume;
+                        changed(v) => { root.viewer-set-volume(v); }
+                    }
+                }
+
+                // --- Изображение: имя файла ---
+                if !root.viewer-is-video: Text {
+                    horizontal-stretch: 1;
+                    text: root.viewer-name;
+                    color: #dddddd;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+
+                // Полноэкранный + закрыть (общие)
+                CtrlBtn {
+                    label: root.viewer-fullscreen ? "🗗" : "⛶";
+                    fsize: 15px;
+                    clicked => { root.viewer-toggle-fullscreen(); }
+                }
+                CtrlBtn {
+                    label: "✕";
+                    fsize: 16px;
+                    w: 44px;
+                    clicked => { root.viewer-close(); }
+                }
+            }
+        }
+
+        // Клавиатура: Esc — закрыть, пробел — play/pause, стрелки — перемотка,
+        // f — полный экран (для видео).
+        key-fs := FocusScope {
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    if (root.viewer-fullscreen) {
+                        root.viewer-toggle-fullscreen();
+                    } else {
+                        root.viewer-close();
+                    }
+                    return EventResult.accept;
+                }
+                if (event.text == " " && root.viewer-is-video) {
+                    root.viewer-toggle-play();
+                    return EventResult.accept;
+                }
+                if (event.text == Key.LeftArrow && root.viewer-is-video) {
+                    root.viewer-skip(-5);
+                    return EventResult.accept;
+                }
+                if (event.text == Key.RightArrow && root.viewer-is-video) {
+                    root.viewer-skip(5);
+                    return EventResult.accept;
+                }
+                if (event.text == "f" && root.viewer-is-video) {
+                    root.viewer-toggle-fullscreen();
+                    return EventResult.accept;
+                }
+                return EventResult.reject;
+            }
+            init => { self.focus(); }
         }
     }
 }
