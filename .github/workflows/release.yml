@@ -1,0 +1,90 @@
+name: Release
+
+# Ручной запуск: вкладка Actions → Release → «Run workflow».
+# Тег и имя релиза — сегодняшняя дата (UTC), например 2026-07-05.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Для линковки Linux-таргета (Slint → yeslogic-fontconfig-sys).
+      - name: Системные зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig-dev pkg-config zip
+
+      - name: Rust + таргеты
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu, x86_64-pc-windows-gnu
+
+      - name: Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Кэш cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Linux с glibc 2.17 — максимальная совместимость (портативность «с флешки»).
+      - name: Сборка Linux (glibc 2.17)
+        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
+
+      - name: Сборка Windows
+        run: cargo zigbuild --release --target x86_64-pc-windows-gnu
+
+      # Собираем портативные бандлы в раскладке appdata/ рядом с бинарником.
+      # libmpv НЕ бандлим (см. инструкцию ниже — пользователь кладёт его сам).
+      - name: Упаковка
+        run: |
+          set -eu
+          VERSION="$(date -u +%Y-%m-%d)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          LIN="micromedia-$VERSION-linux-x86_64"
+          WIN="micromedia-$VERSION-windows-x86_64"
+
+          mkdir -p "dist/$LIN/appdata/libs" "dist/$WIN/appdata/libs"
+
+          cp target/x86_64-unknown-linux-gnu/release/micromedia "dist/$LIN/"
+          cp target/x86_64-pc-windows-gnu/release/micromedia.exe "dist/$WIN/"
+
+          printf 'Положите libmpv.so в appdata/libs/ (рядом с бинарником micromedia).\nПодойдёт libmpv.so / libmpv.so.2 из вашего дистрибутива (пакет libmpv2 / libmpv).\n' \
+            > "dist/$LIN/appdata/libs/ПОЛОЖИТЕ_СЮДА_libmpv.txt"
+          printf 'Положите libmpv-2.dll в appdata/libs/ (рядом с micromedia.exe).\nСкачать: официальные сборки mpv для Windows (в архиве есть libmpv-2.dll).\n' \
+            > "dist/$WIN/appdata/libs/ПОЛОЖИТЕ_СЮДА_libmpv.txt"
+
+          cp FEATURES.MD "dist/$LIN/" 2>/dev/null || true
+          cp FEATURES.MD "dist/$WIN/" 2>/dev/null || true
+
+          tar -C dist -czf "$LIN.tar.gz" "$LIN"
+          ( cd dist && zip -r "../$WIN.zip" "$WIN" )
+
+      - name: Публикация релиза
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          # Идемпотентно: если релиз/тег с этой датой уже есть — пересоздаём.
+          gh release delete "$VERSION" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes "Автосборка MicroMedia от $VERSION (Linux glibc 2.17 + Windows x86_64).
+
+Перед запуском положите libmpv в appdata/libs/ (см. файл-подсказку в архиве):
+- Linux: libmpv.so (пакет libmpv2 / libmpv)
+- Windows: libmpv-2.dll (из официальной сборки mpv)" \
+            "micromedia-$VERSION-linux-x86_64.tar.gz" \
+            "micromedia-$VERSION-windows-x86_64.zip"
