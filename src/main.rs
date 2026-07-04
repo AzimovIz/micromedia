@@ -318,6 +318,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 w.set_file_count(list.len() as i32);
 
+                // Список всех тегов (по алфавиту) для боковой панели.
+                let tag_list: Vec<String> = ui_db
+                    .list_tags()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect();
+                w.set_all_tags(strings_model(tag_list));
+
                 // Дерево (вид «Список»).
                 let nodes = tree::build(&list, &expanded.borrow(), &selected.borrow());
                 let rows: Vec<TreeRow> = nodes

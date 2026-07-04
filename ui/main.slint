@@ -119,6 +119,13 @@ export component MainWindow inherits Window {
     in-out property <int> type-filter: 0;
     callback search-changed();
 
+    // Список всех тегов (по алфавиту) для боковой панели
+    in property <[string]> all-tags;
+
+    // Ширина боковой панели (перетаскиваемая граница)
+    in-out property <length> sidebar-width: 230px;
+    property <bool> sidebar-resizing: false;
+
     // --- Просмотрщик ---
     in property <bool> viewer-open: false;
     in property <bool> viewer-is-video: false;
@@ -184,7 +191,7 @@ export component MainWindow inherits Window {
 
         // Боковая панель: строковый фильтр тегов + автоподсказки
         Rectangle {
-            width: 230px;
+            width: root.sidebar-width;
             background: #191920;
             VerticalLayout {
                 padding: 10px;
@@ -244,7 +251,7 @@ export component MainWindow inherits Window {
                     font-size: 11px;
                 }
 
-                // Подсказки существующих тегов
+                // Подсказки существующих тегов (при вводе в фильтр)
                 for s in root.filter-suggestions: Rectangle {
                     height: 26px;
                     background: fsug-ta.has-hover ? #2f2f3a : #202028;
@@ -263,7 +270,90 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                Rectangle { vertical-stretch: 1; }
+                Rectangle { height: 6px; }
+                Text {
+                    text: "Теги";
+                    color: #e6e6e6;
+                    font-size: 15px;
+                }
+
+                // Все теги по алфавиту: + добавляет в фильтр, − в исключение.
+                // Прокручивается колесом (ListView).
+                ListView {
+                    vertical-stretch: 1;
+                    for name in root.all-tags: Rectangle {
+                        height: 28px;
+                        HorizontalLayout {
+                            padding-left: 2px;
+                            padding-right: 4px;
+                            spacing: 4px;
+                            Rectangle {
+                                width: 22px;
+                                y: (parent.height - self.height) / 2;
+                                height: 22px;
+                                border-radius: 4px;
+                                background: inc-ta.has-hover ? #2e7d32 : #24402a;
+                                Text {
+                                    text: "+";
+                                    color: #d8f0d8;
+                                    font-size: 15px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                inc-ta := TouchArea {
+                                    clicked => { root.filter-add-include(name); }
+                                }
+                            }
+                            Rectangle {
+                                width: 22px;
+                                y: (parent.height - self.height) / 2;
+                                height: 22px;
+                                border-radius: 4px;
+                                background: exc-ta.has-hover ? #a03028 : #402424;
+                                Text {
+                                    text: "−";
+                                    color: #f0d8d8;
+                                    font-size: 15px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                exc-ta := TouchArea {
+                                    clicked => { root.filter-add-exclude(name); }
+                                }
+                            }
+                            Text {
+                                text: name;
+                                color: #dddddd;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Перетаскиваемая граница боковой панели.
+        Rectangle {
+            width: 6px;
+            background: root.sidebar-resizing || split-ta.has-hover ? #3a3a48 : #14141a;
+            split-ta := TouchArea {
+                mouse-cursor: ew-resize;
+                pointer-event(e) => {
+                    if (e.button == PointerEventButton.left) {
+                        if (e.kind == PointerEventKind.down) { root.sidebar-resizing = true; }
+                        if (e.kind == PointerEventKind.up) { root.sidebar-resizing = false; }
+                    }
+                }
+                moved => {
+                    if (self.pressed) {
+                        // Истинная позиция курсора = ширина сайдбара + mouse-x;
+                        // ставим границу под курсор с учётом точки захвата.
+                        root.sidebar-width = Math.clamp(
+                            root.sidebar-width + self.mouse-x - self.pressed-x, 160px, 560px);
+                    }
+                }
             }
         }
 
