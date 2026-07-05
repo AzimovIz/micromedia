@@ -108,15 +108,7 @@ pub struct Mpv {
 impl Mpv {
     /// Находит и загружает libmpv, создаёт и инициализирует mpv-хэндл.
     pub fn load() -> Result<Self, String> {
-        let path = find_libmpv().ok_or_else(|| {
-            "libmpv не найдена. Положи libmpv.so (Linux) / libmpv-2.dll (Windows) \
-             в appdata/libs/ рядом с бинарником или в ./libs/."
-                .to_string()
-        })?;
-
-        log::info!("Загружаю libmpv: {}", path.display());
-        let lib = unsafe { Library::new(&path) }
-            .map_err(|e| format!("не удалось загрузить {}: {e}", path.display()))?;
+        let lib = open_libmpv()?;
 
         unsafe {
             // Достаём все символы; значения fn-указателей копируем из Symbol
@@ -498,6 +490,41 @@ fn cstr(s: &str) -> CString {
 const LIB_NAMES: &[&str] = &["libmpv-2.dll", "mpv-2.dll", "libmpv.dll", "mpv-1.dll"];
 #[cfg(not(target_os = "windows"))]
 const LIB_NAMES: &[&str] = &["libmpv.so", "libmpv.so.2", "libmpv.so.1"];
+
+/// Открывает libmpv: сперва системная (загрузчик ОС по стандартным путям),
+/// затем бандл в appdata/libs/ рядом с бинарником. Явный оверрайд MICROMEDIA_MPV
+/// имеет наивысший приоритет.
+pub(crate) fn open_libmpv() -> Result<Library, String> {
+    // 1. Явный путь через env — выше всего.
+    if let Ok(p) = std::env::var("MICROMEDIA_MPV") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            log::info!("libmpv (MICROMEDIA_MPV): {}", p.display());
+            return unsafe { Library::new(&p) }
+                .map_err(|e| format!("не удалось загрузить {}: {e}", p.display()));
+        }
+    }
+
+    // 2. Системная библиотека — грузим по «голому» имени, загрузчик ОС ищет её
+    //    в стандартных путях (LD_LIBRARY_PATH/ldconfig на Linux, PATH на Windows).
+    for name in LIB_NAMES {
+        if let Ok(lib) = unsafe { Library::new(name) } {
+            log::info!("Использую системный libmpv: {name}");
+            return Ok(lib);
+        }
+    }
+
+    // 3. Бандл рядом с бинарником (портативный режим «с флешки»).
+    if let Some(path) = find_libmpv() {
+        log::info!("Использую libmpv из бандла: {}", path.display());
+        return unsafe { Library::new(&path) }
+            .map_err(|e| format!("не удалось загрузить {}: {e}", path.display()));
+    }
+
+    Err("libmpv не найдена. Установите mpv в систему или положите libmpv.so \
+         (Linux) / libmpv-2.dll (Windows) в appdata/libs/ рядом с бинарником."
+        .to_string())
+}
 
 /// Ищет libmpv в приоритетном порядке каталогов рядом с бинарником и в CWD.
 pub(crate) fn find_libmpv() -> Option<PathBuf> {

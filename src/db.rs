@@ -467,6 +467,9 @@ impl Db {
             .query_row("SELECT id FROM tags WHERE name = ?1", [name], |r| r.get(0))
     }
 
+    // Заготовки под будущий экран «управление тегами» (переименование/ручное
+    // удаление). Авто-очистка осиротевших тегов идёт через delete_tag_if_orphan.
+    #[allow(dead_code)]
     pub fn rename_tag(&self, id: i64, new_name: &str) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE tags SET name = ?2 WHERE id = ?1",
@@ -475,6 +478,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn delete_tag(&self, id: i64) -> rusqlite::Result<()> {
         self.conn.execute("DELETE FROM tags WHERE id = ?1", [id])?;
         Ok(())

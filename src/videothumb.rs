@@ -67,8 +67,7 @@ pub fn generate(
     seek_percent: u32,
     max: u32,
 ) -> Result<Option<f64>, String> {
-    let libpath = crate::mpv::find_libmpv().ok_or_else(|| "libmpv не найдена".to_string())?;
-    let lib = unsafe { Library::new(&libpath) }.map_err(|e| e.to_string())?;
+    let lib = crate::mpv::open_libmpv()?;
 
     unsafe {
         let create: FnCreate = s(&lib, b"mpv_create\0")?;
@@ -230,8 +229,7 @@ pub fn generate(
 
 /// Быстрое определение длительности видео (сек) без рендера кадра.
 pub fn probe_duration(video: &Path) -> Option<f64> {
-    let libpath = crate::mpv::find_libmpv()?;
-    let lib = unsafe { Library::new(&libpath).ok()? };
+    let lib = crate::mpv::open_libmpv().ok()?;
     unsafe {
         let create: FnCreate = s(&lib, b"mpv_create\0").ok()?;
         let init: FnInit = s(&lib, b"mpv_initialize\0").ok()?;
