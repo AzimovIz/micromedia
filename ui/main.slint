@@ -50,6 +50,70 @@ component CtrlBtn inherits Rectangle {
     }
 }
 
+// Слайдер без «залипающего» захвата указателя.
+//
+// std-виджет `Slider` после перетаскивания оставлял артефакт: первый клик по
+// любому другому контролу (пауза/громкость/выход) не засчитывался. Здесь весь
+// ввод свой: `pointer-event`/`moved` внутри собственной `TouchArea`, а на
+// отпускании никакого состояния не остаётся — «хвоста» после скраба нет.
+component MediaSlider inherits Rectangle {
+    in property <float> minimum: 0;
+    in property <float> maximum: 1;
+    in-out property <float> value: 0;
+    // Живое изменение (клик в точку полосы или перетаскивание).
+    callback changed(float);
+
+    min-height: 18px;
+    horizontal-stretch: 1;
+    property <float> span: Math.max(0.0001, root.maximum - root.minimum);
+    property <float> frac: Math.clamp((root.value - root.minimum) / root.span, 0.0, 1.0);
+
+    // Перемотка к позиции курсора: доля ширины → значение.
+    function seek-to(mx: length) {
+        root.value = Math.clamp(
+            root.minimum + (mx / root.width) * root.span,
+            root.minimum, root.maximum);
+        root.changed(root.value);
+    }
+
+    // Трек + заливка.
+    Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: 4px;
+        border-radius: 2px;
+        background: #ffffff30;
+        Rectangle {
+            x: 0;
+            width: parent.width * root.frac;
+            height: 100%;
+            border-radius: 2px;
+            background: #6ab0d0;
+        }
+    }
+    // Ручка.
+    Rectangle {
+        width: 12px;
+        height: 12px;
+        border-radius: 6px;
+        background: sl-ta.pressed ? #eaf6fb : white;
+        y: (parent.height - self.height) / 2;
+        x: (parent.width - self.width) * root.frac;
+    }
+
+    sl-ta := TouchArea {
+        pointer-event(e) => {
+            if (e.button == PointerEventButton.left && e.kind == PointerEventKind.down) {
+                root.seek-to(self.mouse-x);
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                root.seek-to(self.mouse-x);
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     preferred-width: 1280px;
     preferred-height: 800px;
@@ -1529,7 +1593,7 @@ export component MainWindow inherits Window {
                     vertical-alignment: center;
                 }
 
-                if root.viewer-is-video: Slider {
+                if root.viewer-is-video: MediaSlider {
                     horizontal-stretch: 1;
                     minimum: 0;
                     maximum: Math.max(1, root.viewer-duration);
@@ -1567,9 +1631,9 @@ export component MainWindow inherits Window {
                         root.viewer-set-volume(root.viewer-volume);
                         return accept;
                     }
-                    Slider {
+                    MediaSlider {
                         width: 100%;
-                        y: (parent.height - self.height) / 2;
+                        height: 100%;
                         minimum: 0;
                         maximum: 100;
                         value <=> root.viewer-volume;
