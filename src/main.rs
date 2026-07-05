@@ -395,6 +395,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
+    // --- Редактор тегов одного файла (модалка) ---
+    // Отдельный от просмотрщика id, чтобы редактор не конфликтовал с открытым
+    // видео/фото.
+    let editor_file_id: Rc<Cell<i64>> = Rc::new(Cell::new(-1));
+
+    let rebuild_editor_tags: Rc<dyn Fn(i64)> = {
+        let weak = window.as_weak();
+        let ui_db = ui_db.clone();
+        Rc::new(move |id: i64| {
+            if let Some(w) = weak.upgrade() {
+                let items: Vec<TagItem> = ui_db
+                    .tags_for_file(id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| TagItem {
+                        id: t.id as i32,
+                        name: t.name.into(),
+                    })
+                    .collect();
+                w.set_tag_editor_tags(ModelRc::new(VecModel::from(items)));
+            }
+        })
+    };
+
+    let open_tag_editor: Rc<dyn Fn(i64)> = {
+        let weak = window.as_weak();
+        let ui_db = ui_db.clone();
+        let editor_file_id = editor_file_id.clone();
+        let rebuild_editor_tags = rebuild_editor_tags.clone();
+        Rc::new(move |id: i64| {
+            if id < 0 {
+                return;
+            }
+            editor_file_id.set(id);
+            rebuild_editor_tags(id);
+            if let Some(w) = weak.upgrade() {
+                let title = match ui_db.file_info(id) {
+                    Ok(Some((rel, _))) => format!("Теги — {}", basename(&rel)),
+                    _ => "Теги".to_string(),
+                };
+                w.set_tag_editor_title(title.into());
+                w.set_tag_editor_text("".into());
+                w.set_tag_editor_suggestions(strings_model(Vec::new()));
+                w.set_tag_editor_open(true);
+            }
+        })
+    };
+
     rebuild_gallery();
 
     // Ленивая подгрузка миниатюр с кэшем (промахи не кэшируем).
@@ -627,6 +675,129 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // --- Обработчики редактора тегов (модалка) ---
+    // Открытие: из плитки по file-id, из списка — по idx строки дерева.
+    {
+        let open_tag_editor = open_tag_editor.clone();
+        window.on_open_tag_editor(move |id| open_tag_editor(id as i64));
+    }
+    {
+        let tree_mirror = tree_mirror.clone();
+        let open_tag_editor = open_tag_editor.clone();
+        window.on_ctx_edit_tags(move |idx| {
+            let mirror = tree_mirror.borrow();
+            let Some(node) = mirror.get(idx as usize) else {
+                return;
+            };
+            if node.is_folder {
+                return;
+            }
+            let fid = node.file_id;
+            drop(mirror);
+            open_tag_editor(fid);
+        });
+    }
+    // Автоподсказки по мере ввода (исключая уже назначенные теги файла).
+    {
+        let weak = window.as_weak();
+        let ui_db = ui_db.clone();
+        let tag_names = tag_names.clone();
+        let editor_file_id = editor_file_id.clone();
+        window.on_tag_editor_edited(move |text| {
+            if let Some(w) = weak.upgrade() {
+                let id = editor_file_id.get();
+                let assigned: std::collections::HashSet<String> = if id >= 0 {
+                    ui_db
+                        .tags_for_file(id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|t| t.name)
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                let sug = suggest(text.trim(), &tag_names(), &assigned);
+                w.set_tag_editor_suggestions(strings_model(sug));
+            }
+        });
+    }
+    // Назначить тег по имени (создать при необходимости).
+    let editor_assign: Rc<dyn Fn(&str)> = {
+        let weak = window.as_weak();
+        let ui_db = ui_db.clone();
+        let editor_file_id = editor_file_id.clone();
+        let rebuild_editor_tags = rebuild_editor_tags.clone();
+        let rebuild_gallery = rebuild_gallery.clone();
+        Rc::new(move |name: &str| {
+            let id = editor_file_id.get();
+            let name = name.trim();
+            if id < 0 || name.is_empty() {
+                return;
+            }
+            match ui_db.create_tag(name, now_unix()) {
+                Ok(tag_id) => {
+                    if let Err(e) = ui_db.assign_tag(id, tag_id) {
+                        log::error!("assign_tag: {e}");
+                    }
+                }
+                Err(e) => log::error!("create_tag: {e}"),
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_tag_editor_text("".into());
+                w.set_tag_editor_suggestions(strings_model(Vec::new()));
+            }
+            rebuild_editor_tags(id);
+            rebuild_gallery();
+        })
+    };
+    {
+        let editor_assign = editor_assign.clone();
+        window.on_tag_editor_commit(move |t| editor_assign(&t));
+    }
+    {
+        let editor_assign = editor_assign.clone();
+        window.on_tag_editor_pick(move |t| editor_assign(&t));
+    }
+    // Снять тег с файла (с подтверждением в UI); осиротевший тег подчищаем.
+    {
+        let ui_db = ui_db.clone();
+        let editor_file_id = editor_file_id.clone();
+        let rebuild_editor_tags = rebuild_editor_tags.clone();
+        let rebuild_gallery = rebuild_gallery.clone();
+        window.on_tag_editor_remove(move |tag_id| {
+            let id = editor_file_id.get();
+            if id < 0 {
+                return;
+            }
+            if let Err(e) = ui_db.unassign_tag(id, tag_id as i64) {
+                log::error!("unassign_tag: {e}");
+            }
+            let _ = ui_db.delete_tag_if_orphan(tag_id as i64);
+            rebuild_editor_tags(id);
+            rebuild_gallery();
+        });
+    }
+    {
+        let weak = window.as_weak();
+        window.on_tag_editor_cancel(move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_tag_editor_open(false);
+            }
+        });
+    }
+
+    // --- ПКМ-действия плитки по одному файлу (удаление, расположение) ---
+    // Удаление переиспользует общий оверлей подтверждения (ctx_targets ниже).
+    {
+        let ui_db = ui_db.clone();
+        let media = paths.media.clone();
+        window.on_open_file_location(move |id| {
+            if let Ok(Some((rel, _))) = ui_db.file_info(id as i64) {
+                open_location(&media.join(&rel), false);
+            }
+        });
+    }
+
     // --- Шаг C: ПКМ-меню списка (массовые операции над выделением) ---
     let ctx_targets: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
     // Режим панели тегов: 0 — добавить, 1 — убрать.
@@ -758,6 +929,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(w) = weak.upgrade() {
                 let sug = suggest(text.trim(), &tag_names(), &std::collections::HashSet::new());
                 w.set_bulk_tag_suggestions(strings_model(sug));
+            }
+        });
+    }
+
+    // Удаление одного файла из плитки: подтверждение через общий оверлей.
+    {
+        let weak = window.as_weak();
+        let ctx_targets = ctx_targets.clone();
+        window.on_delete_file(move |id| {
+            *ctx_targets.borrow_mut() = vec![id as i64];
+            if let Some(w) = weak.upgrade() {
+                w.set_confirm_delete_text("Безвозвратно удалить с диска: 1 файл?".into());
+                w.set_confirm_delete_open(true);
             }
         });
     }
@@ -964,11 +1148,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let last_click: Rc<RefCell<Option<(i32, std::time::Instant)>>> = Rc::new(RefCell::new(None));
 
     {
+        let weak = window.as_weak();
         let selected = selected.clone();
         let tree_mirror = tree_mirror.clone();
         let tree_refresh_sel = tree_refresh_sel.clone();
         let sel_snapshot = sel_snapshot.clone();
         let last_click = last_click.clone();
+        let thumbs = paths.thumbnails.clone();
         window.on_tree_clicked(move |idx| {
             // Второй клик пары по той же строке в пределах окна двойного клика?
             let now = std::time::Instant::now();
@@ -984,6 +1170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mirror = tree_mirror.borrow();
             let Some(node) = mirror.get(idx as usize) else { return };
+            // Превью в сайдбаре: миниатюра кликнутого файла (папки не трогаем).
+            let clicked_file = (!node.is_folder).then_some(node.file_id);
             {
                 let mut sel = selected.borrow_mut();
                 if node.is_folder {
@@ -1004,6 +1192,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             drop(mirror);
             tree_refresh_sel();
+
+            if let Some(fid) = clicked_file {
+                if let Some(w) = weak.upgrade() {
+                    let p = thumbs.join(format!("{fid}.jpg"));
+                    match slint::Image::load_from_path(&p) {
+                        Ok(img) => {
+                            w.set_preview_image(img);
+                            w.set_preview_has(true);
+                        }
+                        Err(_) => w.set_preview_has(false),
+                    }
+                }
+            }
         });
     }
 

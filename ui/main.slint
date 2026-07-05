@@ -104,6 +104,28 @@ export component MainWindow inherits Window {
     callback confirm-delete-ok();
     callback confirm-delete-cancel();
 
+    // Превью выбранного файла (вид «Список»): миниатюра внизу сайдбара.
+    in property <image> preview-image;
+    in property <bool> preview-has: false;
+
+    // ПКМ-действия по одному файлу (плитка) + пункт «Редактировать теги» списка.
+    callback open-tag-editor(int);      // file-id → открыть редактор тегов
+    callback delete-file(int);          // file-id → подтвердить удаление с диска
+    callback open-file-location(int);   // file-id → открыть расположение
+    callback ctx-edit-tags(int);        // idx строки дерева → редактор тегов файла
+
+    // Редактор тегов одного файла (модалка): чипы с ✕/подтверждением + ввод.
+    in-out property <bool> tag-editor-open: false;
+    in property <string> tag-editor-title;
+    in property <[TagItem]> tag-editor-tags;
+    in-out property <string> tag-editor-text;
+    in property <[string]> tag-editor-suggestions;
+    callback tag-editor-remove(int);    // tag-id
+    callback tag-editor-edited(string);
+    callback tag-editor-commit(string);
+    callback tag-editor-pick(string);
+    callback tag-editor-cancel();
+
     // --- Фильтр по тегам (строка "tag1 -tag2 tag3") ---
     in-out property <string> filter-text;
     in property <[string]> filter-suggestions;
@@ -335,6 +357,39 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
+
+                // Превью выбранного файла (только вид «Список»).
+                if root.view-mode == 1: Rectangle {
+                    height: 190px;
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: "Превью";
+                            color: #e6e6e6;
+                            font-size: 15px;
+                        }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #202028;
+                            border-radius: 6px;
+                            clip: true;
+                            Image {
+                                width: 100%;
+                                height: 100%;
+                                image-fit: contain;
+                                source: root.preview-image;
+                                visible: root.preview-has;
+                            }
+                            if !root.preview-has: Text {
+                                text: "Выберите файл";
+                                color: #6f6f7a;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -493,6 +548,76 @@ export component MainWindow inherits Window {
                     }
                     cell-ta := TouchArea {
                         clicked => { root.open-file(item.id); }
+                        pointer-event(event) => {
+                            if (event.button == PointerEventButton.right
+                                    && event.kind == PointerEventKind.down) {
+                                tile-ctx.show();
+                            }
+                        }
+                    }
+
+                    // ПКМ-меню плитки: одиночный файл.
+                    tile-ctx := PopupWindow {
+                        x: cell-ta.mouse-x;
+                        y: cell-ta.mouse-y;
+                        width: 210px;
+                        height: 3 * 30px + 8px;
+                        close-policy: close-on-click-outside;
+                        Rectangle {
+                            background: #2a2a32;
+                            border-radius: 6px;
+                            border-width: 1px;
+                            border-color: #4a4a54;
+                            VerticalLayout {
+                                padding: 4px;
+                                spacing: 2px;
+                                Rectangle {
+                                    height: 28px;
+                                    background: tcm1.has-hover ? #3a3a44 : transparent;
+                                    border-radius: 4px;
+                                    Text {
+                                        x: 10px;
+                                        text: "Редактировать теги";
+                                        color: #dddddd;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    tcm1 := TouchArea {
+                                        clicked => { root.open-tag-editor(item.id); tile-ctx.close(); }
+                                    }
+                                }
+                                Rectangle {
+                                    height: 28px;
+                                    background: tcm2.has-hover ? #4a2a2a : transparent;
+                                    border-radius: 4px;
+                                    Text {
+                                        x: 10px;
+                                        text: "Удалить файл";
+                                        color: #ecc0c0;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    tcm2 := TouchArea {
+                                        clicked => { root.delete-file(item.id); tile-ctx.close(); }
+                                    }
+                                }
+                                Rectangle {
+                                    height: 28px;
+                                    background: tcm3.has-hover ? #3a3a44 : transparent;
+                                    border-radius: 4px;
+                                    Text {
+                                        x: 10px;
+                                        text: "Открыть расположение";
+                                        color: #dddddd;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                    }
+                                    tcm3 := TouchArea {
+                                        clicked => { root.open-file-location(item.id); tile-ctx.close(); }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 }
@@ -502,9 +627,13 @@ export component MainWindow inherits Window {
                     visible: root.view-mode == 1;
                     width: 100%;
                     height: 100%;
-                    for row[idx] in root.tree-rows: Rectangle {
+                    for row[idx] in root.tree-rows: row-rect := Rectangle {
                         height: 26px;
                         background: row.sel-state == 1 ? #24343f : (rowta.has-hover ? #23232b : transparent);
+                        // Действие тегов затронет ровно один файл (см. compute_targets в Rust):
+                        // это файл, который либо не в выделении, либо один в выделении.
+                        property <bool> single-file:
+                            !row.is-folder && (row.sel-state == 0 || root.selected-count == 1);
                         HorizontalLayout {
                             padding-left: row.depth * 16px + 6px;
                             padding-right: 8px;
@@ -557,7 +686,8 @@ export component MainWindow inherits Window {
                             x: rowta.mouse-x;
                             y: rowta.mouse-y;
                             width: 210px;
-                            height: (row.sel-state != 1 ? 4 : 3) * 30px + 8px;
+                            height: ((row-rect.single-file ? 1 : 2)
+                                + 1 + (row.sel-state != 1 ? 1 : 0)) * 30px + 8px;
                             close-policy: close-on-click-outside;
                             Rectangle {
                                 background: #2a2a32;
@@ -567,7 +697,24 @@ export component MainWindow inherits Window {
                                 VerticalLayout {
                                     padding: 4px;
                                     spacing: 2px;
-                                    Rectangle {
+                                    // Одиночный файл — единый редактор тегов.
+                                    if row-rect.single-file : Rectangle {
+                                        height: 28px;
+                                        background: cm0.has-hover ? #3a3a44 : transparent;
+                                        border-radius: 4px;
+                                        Text {
+                                            x: 10px;
+                                            text: "Редактировать теги";
+                                            color: #dddddd;
+                                            font-size: 12px;
+                                            vertical-alignment: center;
+                                        }
+                                        cm0 := TouchArea {
+                                            clicked => { root.ctx-edit-tags(idx); ctx-popup.close(); }
+                                        }
+                                    }
+                                    // Мультивыбор/папка — массовое добавление/удаление.
+                                    if !row-rect.single-file : Rectangle {
                                         height: 28px;
                                         background: cm1.has-hover ? #3a3a44 : transparent;
                                         border-radius: 4px;
@@ -582,7 +729,7 @@ export component MainWindow inherits Window {
                                             clicked => { root.ctx-add-tags(idx); ctx-popup.close(); }
                                         }
                                     }
-                                    Rectangle {
+                                    if !row-rect.single-file : Rectangle {
                                         height: 28px;
                                         background: cm2.has-hover ? #3a3a44 : transparent;
                                         border-radius: 4px;
@@ -789,6 +936,195 @@ export component MainWindow inherits Window {
                             }
                             dok := TouchArea {
                                 clicked => { root.confirm-delete-ok(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Оверлей: редактор тегов одного файла ---
+        if root.tag-editor-open : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #00000088;
+            // Клик по затемнению — закрыть.
+            TouchArea { clicked => { root.tag-editor-cancel(); } }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 380px;
+                height: 440px;
+                background: #23232b;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #4a4a54;
+                // Поглощает клики внутри карточки.
+                TouchArea { }
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+                    Text {
+                        text: root.tag-editor-title;
+                        color: #e6e6e6;
+                        font-size: 15px;
+                        overflow: elide;
+                    }
+
+                    // Назначенные теги: чип + ✕ с подтверждением.
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: #1c1c22;
+                        border-radius: 6px;
+                        clip: true;
+                        te-list := ListView {
+                            for t in root.tag-editor-tags: Rectangle {
+                                height: 34px;
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 8px;
+                                    padding-top: 3px;
+                                    padding-bottom: 3px;
+                                    spacing: 6px;
+                                    Text {
+                                        text: t.name;
+                                        color: #dddddd;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        overflow: elide;
+                                    }
+                                    Rectangle {
+                                        width: 26px;
+                                        y: (parent.height - self.height) / 2;
+                                        height: 26px;
+                                        border-radius: 4px;
+                                        background: term-ta.has-hover ? #a03028 : #402424;
+                                        Text {
+                                            text: "✕";
+                                            color: #f0d8d8;
+                                            font-size: 12px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                        term-ta := TouchArea {
+                                            clicked => { te-confirm.show(); }
+                                        }
+
+                                        // Подтверждение удаления тега.
+                                        te-confirm := PopupWindow {
+                                            x: -120px;
+                                            y: parent.height + 3px;
+                                            width: 148px;
+                                            height: 62px;
+                                            close-policy: close-on-click-outside;
+                                            Rectangle {
+                                                background: #2a2a32;
+                                                border-radius: 6px;
+                                                border-width: 1px;
+                                                border-color: #4a4a54;
+                                                VerticalLayout {
+                                                    padding: 8px;
+                                                    spacing: 6px;
+                                                    Text {
+                                                        text: "Удалить тег?";
+                                                        color: #e6e6e6;
+                                                        font-size: 12px;
+                                                        horizontal-alignment: center;
+                                                    }
+                                                    HorizontalLayout {
+                                                        spacing: 6px;
+                                                        Rectangle {
+                                                            height: 24px;
+                                                            background: tec.has-hover ? #3a3a44 : #303038;
+                                                            border-radius: 4px;
+                                                            Text {
+                                                                text: "Cancel";
+                                                                color: #dddddd;
+                                                                font-size: 12px;
+                                                                horizontal-alignment: center;
+                                                                vertical-alignment: center;
+                                                            }
+                                                            tec := TouchArea {
+                                                                clicked => { te-confirm.close(); }
+                                                            }
+                                                        }
+                                                        Rectangle {
+                                                            height: 24px;
+                                                            background: teo.has-hover ? #c0392b : #a03028;
+                                                            border-radius: 4px;
+                                                            Text {
+                                                                text: "Ok";
+                                                                color: white;
+                                                                font-size: 12px;
+                                                                horizontal-alignment: center;
+                                                                vertical-alignment: center;
+                                                            }
+                                                            teo := TouchArea {
+                                                                clicked => {
+                                                                    root.tag-editor-remove(t.id);
+                                                                    te-confirm.close();
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Ввод нового тега + автоподсказки по мере ввода.
+                    te-edit := LineEdit {
+                        placeholder-text: "+ тег";
+                        text <=> root.tag-editor-text;
+                        edited(t) => { root.tag-editor-edited(t); }
+                        accepted(t) => { root.tag-editor-commit(t); }
+                    }
+                    if root.tag-editor-suggestions.length > 0: Rectangle {
+                        height: Math.min(root.tag-editor-suggestions.length, 5) * 26px;
+                        VerticalLayout {
+                            spacing: 2px;
+                            for s in root.tag-editor-suggestions: Rectangle {
+                                height: 24px;
+                                background: tesug.has-hover ? #2f2f3a : #202028;
+                                border-radius: 4px;
+                                Text {
+                                    x: 8px;
+                                    width: parent.width - 16px;
+                                    text: s;
+                                    color: #dddddd;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                tesug := TouchArea {
+                                    clicked => { root.tag-editor-pick(s); }
+                                }
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        alignment: end;
+                        Rectangle {
+                            width: 100px;
+                            height: 30px;
+                            background: teclose.has-hover ? #3a3a44 : #303038;
+                            border-radius: 5px;
+                            Text {
+                                text: "Готово";
+                                color: #dddddd;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            teclose := TouchArea {
+                                clicked => { root.tag-editor-cancel(); }
                             }
                         }
                     }
