@@ -1,6 +1,7 @@
 // MicroMedia — галерея + оверлей-просмотрщик (фото/видео) + фон (скан/воркеры).
 
 #[allow(dead_code)] // API дозревает вместе со сканером/тегами
+mod config;
 mod db;
 mod media;
 #[allow(dead_code)] // часть mpv-методов пригодится позже
@@ -253,6 +254,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect(),
     ));
 
+    // Загрузка сохранённого состояния (сортировка, поиск тегов, громкость).
+    let cfg = config::Config::load(&paths.config);
+    window.set_sort_index(cfg.sort_index);
+    window.set_filter_text(cfg.filter_text.clone().into());
+    window.set_viewer_volume(cfg.volume);
+    if let Some(mpv) = &mpv_opt {
+        mpv.set_volume(cfg.volume as f64);
+    }
+
+    // Сохранение состояния (вызываем при изменении сортировки/фильтра/громкости).
+    let save_config: Rc<dyn Fn()> = {
+        let weak = window.as_weak();
+        let config_path = paths.config.clone();
+        Rc::new(move || {
+            if let Some(w) = weak.upgrade() {
+                config::Config {
+                    sort_index: w.get_sort_index(),
+                    filter_text: w.get_filter_text().to_string(),
+                    volume: w.get_viewer_volume(),
+                }
+                .save(&config_path);
+            }
+        })
+    };
+
     // --- Состояние ---
     let current_open_id: Rc<Cell<i64>> = Rc::new(Cell::new(-1));
     // Мультивыбор (вид «Список»): выбранные id, раскрытые папки, зеркало дерева.
@@ -441,7 +467,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let rebuild_gallery = rebuild_gallery.clone();
-        window.on_sort_changed(move || rebuild_gallery());
+        let save_config = save_config.clone();
+        window.on_sort_changed(move || {
+            rebuild_gallery();
+            save_config();
+        });
     }
 
     // Поиск по имени + фильтр по типу — просто пересобираем галерею.
@@ -458,6 +488,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = window.as_weak();
         let tag_names = tag_names.clone();
         let rebuild_gallery = rebuild_gallery.clone();
+        let save_config = save_config.clone();
         window.on_filter_edited(move |text| {
             if let Some(w) = weak.upgrade() {
                 let q = last_token_query(&text);
@@ -465,12 +496,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 w.set_filter_suggestions(strings_model(sug));
             }
             rebuild_gallery();
+            save_config();
         });
     }
 
     {
         let weak = window.as_weak();
         let rebuild_gallery = rebuild_gallery.clone();
+        let save_config = save_config.clone();
         window.on_pick_filter_suggestion(move |chosen| {
             if let Some(w) = weak.upgrade() {
                 let new = replace_last_token(&w.get_filter_text(), &chosen);
@@ -478,6 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 w.set_filter_suggestions(strings_model(Vec::new()));
             }
             rebuild_gallery();
+            save_config();
         });
     }
 
@@ -486,6 +520,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let apply: Rc<dyn Fn(slint::SharedString, TokenOp)> = {
             let weak = window.as_weak();
             let rebuild_gallery = rebuild_gallery.clone();
+            let save_config = save_config.clone();
             Rc::new(move |name, op| {
                 if let Some(w) = weak.upgrade() {
                     let new = set_filter_token(&w.get_filter_text(), name.as_str(), op);
@@ -493,6 +528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     w.set_filter_suggestions(strings_model(Vec::new()));
                 }
                 rebuild_gallery();
+                save_config();
             })
         };
         let a1 = apply.clone();
@@ -1109,10 +1145,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Громкость.
     {
         let mpv = mpv_opt.clone();
+        let save_config = save_config.clone();
         window.on_viewer_set_volume(move |v| {
             if let Some(mpv) = &mpv {
                 mpv.set_volume(v as f64);
             }
+            save_config();
         });
     }
 
@@ -1371,5 +1409,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     window.run()?;
+
+    // Финальное сохранение состояния при выходе.
+    save_config();
     Ok(())
 }

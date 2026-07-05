@@ -828,6 +828,12 @@ export component MainWindow inherits Window {
             property <float> px-start;
             property <float> py-start;
 
+            // Любое движение мыши (даже без нажатия) — показать контролы.
+            // `moved` в Slint срабатывает только при зажатой кнопке, поэтому
+            // ловим изменение позиции курсора напрямую.
+            changed mouse-x => { root.viewer-activity(); }
+            changed mouse-y => { root.viewer-activity(); }
+
             scroll-event(e) => {
                 root.viewer-zoom = Math.clamp(
                     root.viewer-zoom * (e.delta-y > 0 ? 1.1 : 0.9), 1.0, 8.0);
