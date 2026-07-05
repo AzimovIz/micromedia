@@ -81,7 +81,7 @@ jobs:
           gh release delete "$VERSION" --yes --cleanup-tag 2>/dev/null || true
           {
             printf 'Автосборка MicroMedia от %s (Linux glibc 2.17 + Windows x86_64).\n\n' "$VERSION"
-            printf 'Перед запуском положите libmpv в appdata/libs/ (см. файл-подсказку в архиве):\n'
+            printf 'Если на устройстве не установлен MPV плеер, то перед запуском положите libmpv в appdata/libs/ (см. файл-подсказку в архиве):\n'
             printf -- '- Linux: libmpv.so (пакет libmpv2 / libmpv)\n'
             printf -- '- Windows: libmpv-2.dll (из официальной сборки mpv)\n'
           } > release-notes.md
