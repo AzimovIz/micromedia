@@ -220,8 +220,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui_db.file_count()?
     );
 
-    workers::spawn(&paths);
-
     // Загрузка mpv (для просмотрщика видео).
     let mpv_opt: Option<Rc<Mpv>> = match Mpv::load() {
         Ok(m) => Some(Rc::new(m)),
@@ -422,34 +420,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Скан media/ в фоне; по завершении дёргаем rescan-done → пересборка UI.
+    // Полная переиндексация в фоне: скан → превью → хеш → длительность.
+    // Один и тот же путь для старта и кнопки «Обновить». Флаг indexing не даёт
+    // запустить второй проход поверх идущего.
     let start_scan: Rc<dyn Fn()> = {
         let db_path = paths.db.clone();
         let media = paths.media.clone();
+        let thumbs = paths.thumbnails.clone();
         let weak = window.as_weak();
+        let indexing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         Rc::new(move || {
+            use std::sync::atomic::Ordering;
+            if indexing.swap(true, Ordering::SeqCst) {
+                log::info!("Индексация уже идёт — повторный запуск пропущен");
+                return;
+            }
             let db_path = db_path.clone();
             let media = media.clone();
+            let thumbs = thumbs.clone();
             let weak = weak.clone();
+            let indexing = indexing.clone();
             std::thread::spawn(move || {
-                match db::Db::open(&db_path) {
-                    Ok(sdb) => match scanner::scan(&media, &sdb) {
-                        Ok(s) => log::info!(
-                            "Скан: добавлено {}, обновлено {}, удалено {} (на месте {})",
-                            s.added,
-                            s.updated,
-                            s.deleted,
-                            s.seen
-                        ),
-                        Err(e) => log::error!("Скан: ошибка БД: {e}"),
-                    },
-                    Err(e) => log::error!("Скан: не удалось открыть БД: {e}"),
-                }
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(w) = weak.upgrade() {
-                        w.invoke_rescan_done();
-                    }
-                });
+                // UI-обновление: дёргаем rescan-done на потоке событий.
+                let on_update = move || {
+                    let weak = weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(w) = weak.upgrade() {
+                            w.invoke_rescan_done();
+                        }
+                    });
+                };
+                workers::reindex(&db_path, &media, &thumbs, on_update);
+                indexing.store(false, Ordering::SeqCst);
             });
         })
     };

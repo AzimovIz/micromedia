@@ -499,7 +499,7 @@ pub(crate) fn open_libmpv() -> Result<Library, String> {
     if let Ok(p) = std::env::var("MICROMEDIA_MPV") {
         let p = PathBuf::from(p);
         if p.is_file() {
-            log::info!("libmpv (MICROMEDIA_MPV): {}", p.display());
+            log_source_once(&format!("MICROMEDIA_MPV: {}", p.display()));
             return unsafe { Library::new(&p) }
                 .map_err(|e| format!("не удалось загрузить {}: {e}", p.display()));
         }
@@ -509,14 +509,14 @@ pub(crate) fn open_libmpv() -> Result<Library, String> {
     //    в стандартных путях (LD_LIBRARY_PATH/ldconfig на Linux, PATH на Windows).
     for name in LIB_NAMES {
         if let Ok(lib) = unsafe { Library::new(name) } {
-            log::info!("Использую системный libmpv: {name}");
+            log_source_once(&format!("системный libmpv ({name})"));
             return Ok(lib);
         }
     }
 
     // 3. Бандл рядом с бинарником (портативный режим «с флешки»).
     if let Some(path) = find_libmpv() {
-        log::info!("Использую libmpv из бандла: {}", path.display());
+        log_source_once(&format!("libmpv из бандла: {}", path.display()));
         return unsafe { Library::new(&path) }
             .map_err(|e| format!("не удалось загрузить {}: {e}", path.display()));
     }
@@ -524,6 +524,13 @@ pub(crate) fn open_libmpv() -> Result<Library, String> {
     Err("libmpv не найдена. Установите mpv в систему или положите libmpv.so \
          (Linux) / libmpv-2.dll (Windows) в appdata/libs/ рядом с бинарником."
         .to_string())
+}
+
+/// Логирует выбранный источник libmpv один раз за процесс (превью-воркеры грузят
+/// библиотеку на каждое видео — иначе лог засоряется одинаковыми строками).
+fn log_source_once(src: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| log::info!("Использую {src}"));
 }
 
 /// Ищет libmpv в приоритетном порядке каталогов рядом с бинарником и в CWD.

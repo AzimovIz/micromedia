@@ -1,16 +1,15 @@
-//! Фоновые воркеры: генерация миниатюр и контент-хэш (xxh3).
+//! Полный проход обработки медиатеки: индексация → превью → хеш → длительность.
 //!
-//! Отдельный поток со своим соединением к БД. Обрабатывает пачками, при простое
-//! засыпает. Живёт до закрытия приложения (демон-поток).
+//! Одноразовая функция `reindex` запускается в фоновом потоке при старте и по
+//! кнопке «Обновить». Обрабатывает ВСЕ подходящие файлы (пачками, пока не
+//! кончатся), а `on_update` дёргает UI, чтобы показывать прогресс.
 
 use std::io::Read;
 use std::path::Path;
-use std::time::Duration;
 
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::db::{Db, MediaType};
-use crate::paths::Paths;
 
 pub(crate) const THUMB_MAX: u32 = 320;
 const BATCH: i64 = 16;
@@ -21,89 +20,107 @@ const VIDEO_THUMB_PERCENT: u32 = 20;
 const THUMB_OK: i64 = 1;
 const THUMB_ERR: i64 = 2;
 
-pub fn spawn(paths: &Paths) {
-    let db_path = paths.db.clone();
-    let media = paths.media.clone();
-    let thumbs = paths.thumbnails.clone();
+/// Полный проход: индексация media/ → превью → контент-хэш → длительность.
+/// `on_update` вызывается после скана и после каждой пачки превью, чтобы UI
+/// подхватывал новые файлы и миниатюры по мере готовности.
+pub fn reindex(db_path: &Path, media: &Path, thumbs: &Path, on_update: impl Fn()) {
+    let db = match Db::open(db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("Индексация: не удалось открыть БД: {e}");
+            return;
+        }
+    };
 
-    std::thread::spawn(move || {
-        let db = match Db::open(&db_path) {
-            Ok(d) => d,
-            Err(e) => {
-                log::error!("Воркеры: не удалось открыть БД: {e}");
-                return;
-            }
-        };
+    // 1. Индексация файловой системы.
+    match crate::scanner::scan(media, &db) {
+        Ok(s) => log::info!(
+            "Скан: добавлено {}, обновлено {}, удалено {} (на месте {})",
+            s.added,
+            s.updated,
+            s.deleted,
+            s.seen
+        ),
+        Err(e) => log::error!("Скан: {e}"),
+    }
+    on_update();
 
-        loop {
-            let mut progressed = false;
-
-            // --- Миниатюры ---
-            if let Ok(batch) = db.files_needing_thumb(BATCH) {
-                for (id, rel, mt) in batch {
-                    let src = media.join(&rel);
-                    let dst = thumbs.join(format!("{id}.jpg"));
-                    let res: Result<Option<f64>, String> = match mt {
-                        MediaType::Image => make_image_thumb(&src, &dst).map(|_| None),
-                        MediaType::Video => {
-                            crate::videothumb::generate(&src, &dst, VIDEO_THUMB_PERCENT, THUMB_MAX)
-                        }
-                    };
-                    match res {
-                        Ok(dur) => {
-                            let _ = db.set_thumb_state(id, THUMB_OK);
-                            if let Some(d) = dur {
-                                let _ = db.set_duration(id, (d * 1000.0) as i64);
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Миниатюра {rel}: {e}");
-                            let _ = db.set_thumb_state(id, THUMB_ERR);
-                        }
-                    }
-                    progressed = true;
+    // 2. Миниатюры — все, пачками (ошибочные помечаются и выпадают).
+    loop {
+        let batch = db.files_needing_thumb(BATCH).unwrap_or_default();
+        if batch.is_empty() {
+            break;
+        }
+        for (id, rel, mt) in batch {
+            let src = media.join(&rel);
+            let dst = thumbs.join(format!("{id}.jpg"));
+            let res: Result<Option<f64>, String> = match mt {
+                MediaType::Image => make_image_thumb(&src, &dst).map(|_| None),
+                MediaType::Video => {
+                    crate::videothumb::generate(&src, &dst, VIDEO_THUMB_PERCENT, THUMB_MAX)
                 }
-            }
-
-            // --- Контент-хэш ---
-            if let Ok(batch) = db.files_without_hash(BATCH) {
-                for (id, rel) in batch {
-                    let src = media.join(&rel);
-                    match hash_file(&src) {
-                        Ok(h) => {
-                            let _ = db.set_hash(id, h);
-                            progressed = true;
-                        }
-                        // При ошибке hash остаётся NULL; файл, скорее всего, пропал
-                        // и следующий скан пометит is_deleted=1 — тогда он выпадет.
-                        Err(e) => log::warn!("Хэш {rel}: {e}"),
+            };
+            match res {
+                Ok(dur) => {
+                    let _ = db.set_thumb_state(id, THUMB_OK);
+                    if let Some(d) = dur {
+                        let _ = db.set_duration(id, (d * 1000.0) as i64);
                     }
                 }
-            }
-
-            // --- Длительность видео (по одному, пока не кончатся) ---
-            if let Ok(batch) = db.videos_without_duration(BATCH) {
-                for (id, rel) in batch {
-                    let src = media.join(&rel);
-                    match crate::videothumb::probe_duration(&src) {
-                        // -1 = «неизвестно» (не пробуем повторно вечно)
-                        Some(d) => {
-                            let _ = db.set_duration(id, (d * 1000.0) as i64);
-                        }
-                        None => {
-                            log::warn!("Длительность {rel}: не определить");
-                            let _ = db.set_duration(id, -1);
-                        }
-                    }
-                    progressed = true;
+                Err(e) => {
+                    log::warn!("Миниатюра {rel}: {e}");
+                    let _ = db.set_thumb_state(id, THUMB_ERR);
                 }
-            }
-
-            if !progressed {
-                std::thread::sleep(Duration::from_secs(2));
             }
         }
-    });
+        on_update();
+    }
+
+    // 3. Контент-хэш — все. При стойкой ошибке (файл пропал) пачка не даёт
+    //    прогресса → выходим, чтобы не зациклиться (хэш остаётся NULL).
+    loop {
+        let batch = db.files_without_hash(BATCH).unwrap_or_default();
+        if batch.is_empty() {
+            break;
+        }
+        let mut progressed = false;
+        for (id, rel) in batch {
+            let src = media.join(&rel);
+            match hash_file(&src) {
+                Ok(h) => {
+                    let _ = db.set_hash(id, h);
+                    progressed = true;
+                }
+                Err(e) => log::warn!("Хэш {rel}: {e}"),
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    // 4. Длительность видео — все (None → -1 sentinel, чтобы не пробовать вечно).
+    loop {
+        let batch = db.videos_without_duration(BATCH).unwrap_or_default();
+        if batch.is_empty() {
+            break;
+        }
+        for (id, rel) in batch {
+            let src = media.join(&rel);
+            match crate::videothumb::probe_duration(&src) {
+                Some(d) => {
+                    let _ = db.set_duration(id, (d * 1000.0) as i64);
+                }
+                None => {
+                    log::warn!("Длительность {rel}: не определить");
+                    let _ = db.set_duration(id, -1);
+                }
+            }
+        }
+    }
+
+    // Финальное обновление (длительность влияет на сортировку).
+    on_update();
 }
 
 /// Делает JPEG-миниатюру, вписанную в THUMB_MAX×THUMB_MAX с сохранением пропорций.
