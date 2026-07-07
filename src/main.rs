@@ -125,15 +125,44 @@ fn set_filter_token(text: &str, name: &str, op: TokenOp) -> String {
     tokens.join(" ")
 }
 
-/// Заменяет последний токен строки фильтра на выбранный тег (+ пробел).
-fn replace_last_token(text: &str, chosen: &str) -> String {
-    let start = if text.ends_with(char::is_whitespace) {
+/// Байтовый индекс начала последнего (редактируемого) токена.
+fn last_token_start(text: &str) -> usize {
+    if text.ends_with(char::is_whitespace) {
         text.len()
     } else {
         text.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0)
-    };
+    }
+}
+
+/// Заменяет последний токен строки фильтра на выбранный тег (+ пробел).
+fn replace_last_token(text: &str, chosen: &str) -> String {
+    let start = last_token_start(text);
     let neg = text[start..].starts_with('-');
     format!("{}{}{} ", &text[..start], if neg { "-" } else { "" }, chosen)
+}
+
+/// Навигация ↑/↓: подставляет тег в последний токен БЕЗ завершающего пробела,
+/// сохраняя набранный префикс «-» (чтобы можно было листать дальше).
+fn nav_last_token(text: &str, chosen: &str) -> String {
+    let start = last_token_start(text);
+    let neg = text[start..].starts_with('-');
+    format!("{}{}{}", &text[..start], if neg { "-" } else { "" }, chosen)
+}
+
+/// Коммит последнего токена в фильтр: include или (exclude → с «-») + пробел.
+/// None, если токен пуст (нечего добавлять).
+fn commit_last_token(text: &str, exclude: bool) -> Option<String> {
+    let start = last_token_start(text);
+    let name = text[start..].trim_start_matches('-');
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}{}{} ",
+        &text[..start],
+        if exclude { "-" } else { "" },
+        name
+    ))
 }
 
 /// Существующие теги, чьё имя содержит query (исключая уже назначенные).
@@ -559,6 +588,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let new = replace_last_token(&w.get_filter_text(), &chosen);
                 w.set_filter_text(new.into());
                 w.set_filter_suggestions(strings_model(Vec::new()));
+            }
+            rebuild_gallery();
+            save_config();
+        });
+    }
+
+    // Навигация ↑/↓ по подсказкам фильтра: подставить тег в последний токен.
+    // Подсказки НЕ пересчитываем — чтобы по списку можно было листать.
+    {
+        let weak = window.as_weak();
+        let rebuild_gallery = rebuild_gallery.clone();
+        let save_config = save_config.clone();
+        window.on_filter_nav(move |chosen| {
+            if let Some(w) = weak.upgrade() {
+                let new = nav_last_token(&w.get_filter_text(), &chosen);
+                w.set_filter_text(new.into());
+            }
+            rebuild_gallery();
+            save_config();
+        });
+    }
+
+    // Enter — добавить последний токен в фильтр (include);
+    // Shift+Enter — как исключение (с «-»). Затем начинаем новый токен.
+    {
+        let weak = window.as_weak();
+        let rebuild_gallery = rebuild_gallery.clone();
+        let save_config = save_config.clone();
+        window.on_filter_commit(move |exclude| {
+            if let Some(w) = weak.upgrade() {
+                if let Some(new) = commit_last_token(&w.get_filter_text(), exclude) {
+                    w.set_filter_text(new.into());
+                    w.set_filter_suggestions(strings_model(Vec::new()));
+                }
             }
             rebuild_gallery();
             save_config();

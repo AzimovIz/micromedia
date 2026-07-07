@@ -261,6 +261,16 @@ export component MainWindow inherits Window {
     // Внутренний: фоновая генерация миниатюры завершена (id файла)
     callback thumb-updated(int);
 
+    // Индекс подсвеченной подсказки для навигации ↑/↓ (−1 = ничего).
+    property <int> add-suggest-idx: -1;
+    property <int> tag-editor-suggest-idx: -1;
+    property <int> bulk-suggest-idx: -1;
+    property <int> filter-suggest-idx: -1;
+    // Навигация ↑/↓ по фильтру: подставить тег в последний токен (без коммита).
+    callback filter-nav(string);
+    // Enter — добавить тег в фильтр; true = исключение (Shift+Enter, с минусом).
+    callback filter-commit(bool);
+
     property <bool> video-mode: root.viewer-open && root.viewer-is-video;
 
     // Подложка (непрозрачная). Прячется только в режиме видео.
@@ -328,23 +338,91 @@ export component MainWindow inherits Window {
                     color: #e6e6e6;
                     font-size: 15px;
                 }
-                LineEdit {
-                    placeholder-text: "Tag search...";
-                    // приглушаем, пока поле пустое (виден плейсхолдер)
-                    opacity: root.filter-text == "" ? 0.5 : 1.0;
-                    text <=> root.filter-text;
-                    edited(t) => { root.filter-edited(t); }
+                // Поле фильтра на «сыром» TextInput — чтобы управлять курсором:
+                // после подстановки/коммита ставим его в конец строки.
+                Rectangle {
+                    height: 32px;
+                    border-radius: 4px;
+                    border-width: 1px;
+                    border-color: fti.has-focus ? #5a5a68 : #33333c;
+                    background: #202028;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Rectangle {
+                            clip: true;
+                            // Плейсхолдер, пока поле пустое.
+                            Text {
+                                width: 100%;
+                                height: 100%;
+                                vertical-alignment: center;
+                                text: root.filter-text == "" ? "Tag search..." : "";
+                                color: #6f6f7a;
+                                font-size: 14px;
+                                overflow: elide;
+                            }
+                            fti := TextInput {
+                                // Горизонтальная прокрутка за курсором (как в LineEditBase).
+                                property <length> computed-x;
+                                x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.computed-x));
+                                width: max(parent.width - self.text-cursor-width, self.preferred-width);
+                                height: 100%;
+                                vertical-alignment: center;
+                                single-line: true;
+                                color: #e6e6e6;
+                                font-size: 14px;
+                                text <=> root.filter-text;
+
+                                cursor-position-changed(cpos) => {
+                                    if (cpos.x + self.computed-x < 0) {
+                                        self.computed-x = -cpos.x;
+                                    } else if (cpos.x + self.computed-x > parent.width - self.text-cursor-width) {
+                                        self.computed-x = parent.width - cpos.x - self.text-cursor-width;
+                                    }
+                                }
+
+                                edited => { root.filter-suggest-idx = -1; root.filter-edited(self.text); }
+
+                                // ↑/↓ — листать подсказки (подставляются в последний токен),
+                                // Enter — добавить в фильтр, Shift+Enter — в исключение.
+                                // После каждого — курсор в конец (большое смещение клампится).
+                                key-pressed(event) => {
+                                    if (root.filter-suggestions.length > 0 && event.text == Key.DownArrow) {
+                                        root.filter-suggest-idx = root.filter-suggest-idx + 1 >= root.filter-suggestions.length
+                                            ? 0 : root.filter-suggest-idx + 1;
+                                        root.filter-nav(root.filter-suggestions[root.filter-suggest-idx]);
+                                        fti.set-selection-offsets(100000, 100000);
+                                        return EventResult.accept;
+                                    }
+                                    if (root.filter-suggestions.length > 0 && event.text == Key.UpArrow) {
+                                        root.filter-suggest-idx = root.filter-suggest-idx <= 0
+                                            ? root.filter-suggestions.length - 1 : root.filter-suggest-idx - 1;
+                                        root.filter-nav(root.filter-suggestions[root.filter-suggest-idx]);
+                                        fti.set-selection-offsets(100000, 100000);
+                                        return EventResult.accept;
+                                    }
+                                    if (event.text == Key.Return) {
+                                        root.filter-suggest-idx = -1;
+                                        root.filter-commit(event.modifiers.shift);
+                                        fti.set-selection-offsets(100000, 100000);
+                                        return EventResult.accept;
+                                    }
+                                    return EventResult.reject;
+                                }
+                            }
+                        }
+                    }
                 }
                 Text {
-                    text: "«-tag» исключает";
+                    text: "«-tag» исключает · Shift+Enter";
                     color: #6f6f7a;
                     font-size: 11px;
                 }
 
                 // Подсказки существующих тегов (при вводе в фильтр)
-                for s in root.filter-suggestions: Rectangle {
+                for s[i] in root.filter-suggestions: Rectangle {
                     height: 26px;
-                    background: fsug-ta.has-hover ? #2f2f3a : #202028;
+                    background: (i == root.filter-suggest-idx || fsug-ta.has-hover) ? #2f2f3a : #202028;
                     border-radius: 4px;
                     Text {
                         x: 8px;
@@ -877,17 +955,33 @@ export component MainWindow inherits Window {
                     bulk-edit := LineEdit {
                         placeholder-text: "тег";
                         text <=> root.bulk-tag-text;
-                        edited(t) => { root.bulk-tag-edited(t); }
-                        accepted(t) => { root.bulk-tag-commit(t); }
+                        edited(t) => { root.bulk-suggest-idx = -1; root.bulk-tag-edited(t); }
+                        accepted(t) => { root.bulk-suggest-idx = -1; root.bulk-tag-commit(t); }
+                        // ↑/↓ — выбрать подсказку и подставить её текст в поле.
+                        key-pressed(event) => {
+                            if (root.bulk-tag-suggestions.length > 0 && event.text == Key.DownArrow) {
+                                root.bulk-suggest-idx = root.bulk-suggest-idx + 1 >= root.bulk-tag-suggestions.length
+                                    ? 0 : root.bulk-suggest-idx + 1;
+                                root.bulk-tag-text = root.bulk-tag-suggestions[root.bulk-suggest-idx];
+                                return EventResult.accept;
+                            }
+                            if (root.bulk-tag-suggestions.length > 0 && event.text == Key.UpArrow) {
+                                root.bulk-suggest-idx = root.bulk-suggest-idx <= 0
+                                    ? root.bulk-tag-suggestions.length - 1 : root.bulk-suggest-idx - 1;
+                                root.bulk-tag-text = root.bulk-tag-suggestions[root.bulk-suggest-idx];
+                                return EventResult.accept;
+                            }
+                            return EventResult.reject;
+                        }
                     }
                     Rectangle {
                         vertical-stretch: 1;
                         VerticalLayout {
                             spacing: 2px;
                             alignment: start;
-                            for s in root.bulk-tag-suggestions: Rectangle {
+                            for s[i] in root.bulk-tag-suggestions: Rectangle {
                                 height: 26px;
-                                background: bsug.has-hover ? #2f2f3a : #202028;
+                                background: (i == root.bulk-suggest-idx || bsug.has-hover) ? #2f2f3a : #202028;
                                 border-radius: 4px;
                                 Text {
                                     x: 8px;
@@ -1146,16 +1240,32 @@ export component MainWindow inherits Window {
                     te-edit := LineEdit {
                         placeholder-text: "+ тег";
                         text <=> root.tag-editor-text;
-                        edited(t) => { root.tag-editor-edited(t); }
-                        accepted(t) => { root.tag-editor-commit(t); }
+                        edited(t) => { root.tag-editor-suggest-idx = -1; root.tag-editor-edited(t); }
+                        accepted(t) => { root.tag-editor-suggest-idx = -1; root.tag-editor-commit(t); }
+                        // ↑/↓ — выбрать подсказку и подставить её текст в поле.
+                        key-pressed(event) => {
+                            if (root.tag-editor-suggestions.length > 0 && event.text == Key.DownArrow) {
+                                root.tag-editor-suggest-idx = root.tag-editor-suggest-idx + 1 >= root.tag-editor-suggestions.length
+                                    ? 0 : root.tag-editor-suggest-idx + 1;
+                                root.tag-editor-text = root.tag-editor-suggestions[root.tag-editor-suggest-idx];
+                                return EventResult.accept;
+                            }
+                            if (root.tag-editor-suggestions.length > 0 && event.text == Key.UpArrow) {
+                                root.tag-editor-suggest-idx = root.tag-editor-suggest-idx <= 0
+                                    ? root.tag-editor-suggestions.length - 1 : root.tag-editor-suggest-idx - 1;
+                                root.tag-editor-text = root.tag-editor-suggestions[root.tag-editor-suggest-idx];
+                                return EventResult.accept;
+                            }
+                            return EventResult.reject;
+                        }
                     }
                     if root.tag-editor-suggestions.length > 0: Rectangle {
                         height: Math.min(root.tag-editor-suggestions.length, 5) * 26px;
                         VerticalLayout {
                             spacing: 2px;
-                            for s in root.tag-editor-suggestions: Rectangle {
+                            for s[i] in root.tag-editor-suggestions: Rectangle {
                                 height: 24px;
-                                background: tesug.has-hover ? #2f2f3a : #202028;
+                                background: (i == root.tag-editor-suggest-idx || tesug.has-hover) ? #2f2f3a : #202028;
                                 border-radius: 4px;
                                 Text {
                                     x: 8px;
@@ -1481,8 +1591,24 @@ export component MainWindow inherits Window {
                     // приглушаем поле над картинкой, пока оно пустое
                     opacity: root.add-tag-text == "" ? 0.5 : 1.0;
                     text <=> root.add-tag-text;
-                    edited(t) => { root.add-tag-edited(t); }
-                    accepted(t) => { root.add-tag-commit(t); }
+                    edited(t) => { root.add-suggest-idx = -1; root.add-tag-edited(t); }
+                    accepted(t) => { root.add-suggest-idx = -1; root.add-tag-commit(t); }
+                    // ↑/↓ — выбрать подсказку и подставить её текст в поле.
+                    key-pressed(event) => {
+                        if (root.add-tag-suggestions.length > 0 && event.text == Key.DownArrow) {
+                            root.add-suggest-idx = root.add-suggest-idx + 1 >= root.add-tag-suggestions.length
+                                ? 0 : root.add-suggest-idx + 1;
+                            root.add-tag-text = root.add-tag-suggestions[root.add-suggest-idx];
+                            return EventResult.accept;
+                        }
+                        if (root.add-tag-suggestions.length > 0 && event.text == Key.UpArrow) {
+                            root.add-suggest-idx = root.add-suggest-idx <= 0
+                                ? root.add-tag-suggestions.length - 1 : root.add-suggest-idx - 1;
+                            root.add-tag-text = root.add-tag-suggestions[root.add-suggest-idx];
+                            return EventResult.accept;
+                        }
+                        return EventResult.reject;
+                    }
                 }
             }
 
@@ -1495,9 +1621,9 @@ export component MainWindow inherits Window {
                 background: #202028;
                 border-radius: 4px;
                 VerticalLayout {
-                    for s in root.add-tag-suggestions: Rectangle {
+                    for s[i] in root.add-tag-suggestions: Rectangle {
                         height: 26px;
-                        background: asug-ta.has-hover ? #2f2f3a : transparent;
+                        background: (i == root.add-suggest-idx || asug-ta.has-hover) ? #2f2f3a : transparent;
                         Text {
                             x: 8px;
                             width: parent.width - 16px;
@@ -1508,6 +1634,13 @@ export component MainWindow inherits Window {
                             overflow: elide;
                         }
                         asug-ta := TouchArea {
+                            // Пока поле ввода в фокусе, первый клик по подсказке
+                            // тратится на перенос фокуса обратно в key-fs (в модалке
+                            // FocusScope нет — там проблемы нет). Уводим фокус заранее,
+                            // при наведении, чтобы сам клик уже ничего не переносил.
+                            changed has-hover => {
+                                if (self.has-hover) { key-fs.focus(); }
+                            }
                             clicked => { root.pick-add-suggestion(s); }
                         }
                     }
