@@ -1355,6 +1355,7 @@ export component MainWindow inherits Window {
             property <bool> dragging: false;
             property <float> px-start;
             property <float> py-start;
+            property <float> nz; // новый зум (временное, для zoom-at)
 
             // Любое движение мыши (даже без нажатия) — показать контролы.
             // `moved` в Slint срабатывает только при зажатой кнопке, поэтому
@@ -1362,12 +1363,30 @@ export component MainWindow inherits Window {
             changed mouse-x => { root.viewer-activity(); }
             changed mouse-y => { root.viewer-activity(); }
 
+            // Зум к точке под курсором: удерживаем точку картинки под курсором
+            // на месте, пересчитывая пан. sx/sy — доля вьюпорта под курсором;
+            // root.viewer-zoom здесь ещё СТАРЫЙ, self.nz — новый. Картинка —
+            // «бокс» W·zoom, центрированный и сдвинутый на pan·W; выводим pan'
+            // из условия «доля бокса под курсором не меняется».
+            function zoom-at(sx: float, sy: float) {
+                root.viewer-pan-x = sx
+                    - self.nz * (sx - (1 - root.viewer-zoom) / 2 - root.viewer-pan-x) / root.viewer-zoom
+                    - (1 - self.nz) / 2;
+                root.viewer-pan-y = sy
+                    - self.nz * (sy - (1 - root.viewer-zoom) / 2 - root.viewer-pan-y) / root.viewer-zoom
+                    - (1 - self.nz) / 2;
+                root.viewer-zoom = self.nz;
+            }
+
             scroll-event(e) => {
-                root.viewer-zoom = Math.clamp(
+                self.nz = Math.clamp(
                     root.viewer-zoom * (e.delta-y > 0 ? 1.1 : 0.9), 1.0, 8.0);
-                if (root.viewer-zoom <= 1.0) {
+                if (self.nz <= 1.0) {
+                    root.viewer-zoom = 1.0;
                     root.viewer-pan-x = 0;
                     root.viewer-pan-y = 0;
+                } else {
+                    self.zoom-at(self.mouse-x / self.width, self.mouse-y / self.height);
                 }
                 root.viewer-transform-changed();
                 root.viewer-activity();
