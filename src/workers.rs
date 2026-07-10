@@ -54,17 +54,22 @@ pub fn reindex(db_path: &Path, media: &Path, thumbs: &Path, on_update: impl Fn()
         for (id, rel, mt) in batch {
             let src = media.join(&rel);
             let dst = thumbs.join(format!("{id}.jpg"));
-            let res: Result<Option<f64>, String> = match mt {
-                MediaType::Image => make_image_thumb(&src, &dst).map(|_| None),
+            let res: Result<(Option<f64>, Option<(i64, i64)>), String> = match mt {
+                MediaType::Image => make_image_thumb(&src, &dst).map(|_| (None, None)),
                 MediaType::Video => {
                     crate::videothumb::generate(&src, &dst, VIDEO_THUMB_PERCENT, THUMB_MAX)
                 }
             };
             match res {
-                Ok(dur) => {
+                Ok((dur, dims)) => {
                     let _ = db.set_thumb_state(id, THUMB_OK);
                     if let Some(d) = dur {
                         let _ = db.set_duration(id, (d * 1000.0) as i64);
+                    }
+                    // Разрешение видео получаем даром вместе с превью; фото
+                    // заполняются отдельным проходом (шаг 5) из заголовка.
+                    if let Some((w, h)) = dims {
+                        let _ = db.set_resolution(id, h, w);
                     }
                 }
                 Err(e) => {
@@ -116,6 +121,42 @@ pub fn reindex(db_path: &Path, media: &Path, thumbs: &Path, on_update: impl Fn()
                     let _ = db.set_duration(id, -1);
                 }
             }
+        }
+    }
+
+    // 5. Разрешение (width×height): фото — из заголовка, видео — mpv-пробой.
+    //    Неопределимые помечаем sentinel'ом (-1), чтобы не пробовать вечно.
+    loop {
+        let batch = db.item_without_resolution(BATCH).unwrap_or_default();
+        if batch.is_empty() {
+            break;
+        }
+        let mut progressed = false;
+        for (id, rel, is_video) in batch {
+            let src = media.join(&rel);
+            let dims = if is_video {
+                crate::videothumb::probe_resolution(&src)
+            } else {
+                // image_dimensions читает только заголовок (без полного декода).
+                image::image_dimensions(&src)
+                    .ok()
+                    .map(|(w, h)| (w as i64, h as i64))
+            };
+            let (w, h) = match dims {
+                Some(wh) => wh,
+                None => {
+                    log::warn!("Разрешение {rel}: не определить");
+                    (-1, -1)
+                }
+            };
+            // set_resolution(id, height, width) — порядок аргументов важен.
+            if db.set_resolution(id, h, w).is_ok() {
+                progressed = true;
+            }
+        }
+        // Защита от зацикливания, если БД не принимает записи.
+        if !progressed {
+            break;
         }
     }
 

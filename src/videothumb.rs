@@ -60,13 +60,15 @@ unsafe fn s<T: Copy>(lib: &Library, n: &[u8]) -> Result<T, String> {
 }
 
 /// Делает миниатюру `out_jpg` (вписанную в `max`×`max`) из кадра `video` на
-/// позиции `seek_percent`%. Возвращает длительность видео (сек), если удалось.
+/// позиции `seek_percent`%. Возвращает `(длительность сек, (width, height))` —
+/// оба поля опциональны (mpv мог не отдать значение). Разрешение читаем здесь же,
+/// пока mpv-хэндл жив, чтобы не поднимать его повторно в отдельном проходе.
 pub fn generate(
     video: &Path,
     out_jpg: &Path,
     seek_percent: u32,
     max: u32,
-) -> Result<Option<f64>, String> {
+) -> Result<(Option<f64>, Option<(i64, i64)>), String> {
     let lib = crate::mpv::open_libmpv()?;
 
     unsafe {
@@ -159,9 +161,16 @@ pub fn generate(
         // Длительность заодно (пока mpv-хэндл жив).
         let dur = get_f64(get_prop, h, "duration");
 
-        // Целевой размер: вписываем видео в max×max.
-        let vw = get_i64(get_prop, h, "dwidth").unwrap_or(max as i64).max(1) as u32;
-        let vh = get_i64(get_prop, h, "dheight").unwrap_or(max as i64).max(1) as u32;
+        // Целевой размер: вписываем видео в max×max. Заодно это и есть разрешение
+        // файла (display-размеры с учётом aspect) — отдаём его наружу.
+        let dw = get_i64(get_prop, h, "dwidth").filter(|&v| v > 0);
+        let dh = get_i64(get_prop, h, "dheight").filter(|&v| v > 0);
+        let resolution = match (dw, dh) {
+            (Some(w), Some(h)) => Some((w, h)),
+            _ => None,
+        };
+        let vw = dw.unwrap_or(max as i64).max(1) as u32;
+        let vh = dh.unwrap_or(max as i64).max(1) as u32;
         let (tw, th) = fit(vw, vh, max);
 
         // rgb0 = 4 байта/пиксель; stride кратен 64 для SIMD.
@@ -223,7 +232,7 @@ pub fn generate(
             let _ = std::fs::remove_file(&tmp);
             e.to_string()
         })?;
-        Ok(dur)
+        Ok((dur, resolution))
     }
 }
 
@@ -283,6 +292,81 @@ pub fn probe_duration(video: &Path) -> Option<f64> {
         }
         destroy(h);
         dur
+    }
+}
+
+/// Разрешение видео (width, height) в пикселях, без рендера кадра.
+///
+/// Читаем display-размеры `dwidth`/`dheight` (с учётом aspect), а при их
+/// отсутствии — «сырые» `width`/`height`. После FILE_LOADED значения ещё могут
+/// быть нулевыми, пока не инициализировался видеотрек, поэтому опрашиваем в цикле.
+pub fn probe_resolution(video: &Path) -> Option<(i64, i64)> {
+    let lib = crate::mpv::open_libmpv().ok()?;
+    unsafe {
+        let create: FnCreate = s(&lib, b"mpv_create\0").ok()?;
+        let init: FnInit = s(&lib, b"mpv_initialize\0").ok()?;
+        let destroy: FnDestroy = s(&lib, b"mpv_terminate_destroy\0").ok()?;
+        let set_opt: FnSetOpt = s(&lib, b"mpv_set_option_string\0").ok()?;
+        let command: FnCommand = s(&lib, b"mpv_command\0").ok()?;
+        let get_prop: FnGetProp = s(&lib, b"mpv_get_property\0").ok()?;
+        let wait_event: FnWaitEvent = s(&lib, b"mpv_wait_event\0").ok()?;
+
+        let h = create();
+        if h.is_null() {
+            return None;
+        }
+        let setopt = |k: &str, v: &str| {
+            if let (Ok(ck), Ok(cv)) = (CString::new(k), CString::new(v)) {
+                set_opt(h, ck.as_ptr(), cv.as_ptr());
+            }
+        };
+        setopt("vo", "null");
+        setopt("hwdec", "no");
+        setopt("audio", "no");
+        setopt("terminal", "no");
+        setopt("msg-level", "all=no");
+        setopt("pause", "yes");
+        if init(h) < 0 {
+            destroy(h);
+            return None;
+        }
+        let cmd = CString::new("loadfile").ok()?;
+        let file = CString::new(video.to_string_lossy().as_ref()).ok()?;
+        let args: [*const c_char; 3] = [cmd.as_ptr(), file.as_ptr(), std::ptr::null()];
+        if command(h, args.as_ptr()) < 0 {
+            destroy(h);
+            return None;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut res = None;
+        let mut loaded = false;
+        while Instant::now() < deadline {
+            let ev = wait_event(h, 0.2);
+            if !ev.is_null() {
+                match (*ev).event_id {
+                    EV_FILE_LOADED => loaded = true,
+                    EV_END_FILE | EV_SHUTDOWN => break,
+                    _ => {}
+                }
+            }
+            if loaded {
+                let mut w = get_i64(get_prop, h, "dwidth").filter(|&v| v > 0);
+                if w.is_none() {
+                    w = get_i64(get_prop, h, "width").filter(|&v| v > 0);
+                }
+                let mut hh = get_i64(get_prop, h, "dheight").filter(|&v| v > 0);
+                if hh.is_none() {
+                    hh = get_i64(get_prop, h, "height").filter(|&v| v > 0);
+                }
+                if let (Some(w), Some(hh)) = (w, hh) {
+                    res = Some((w, hh));
+                    break;
+                }
+            }
+        }
+        destroy(h);
+        res
     }
 }
 

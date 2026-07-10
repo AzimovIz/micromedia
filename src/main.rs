@@ -36,6 +36,14 @@ unsafe extern "C" fn on_mpv_update(ctx: *mut std::ffi::c_void) {
     });
 }
 
+/// Размер в строку для UI: пусто, если неизвестно (NULL) или не определить (-1).
+fn fmt_dim(v: Option<i64>) -> slint::SharedString {
+    match v {
+        Some(n) if n > 0 => n.to_string().into(),
+        _ => slint::SharedString::new(),
+    }
+}
+
 /// Преобразует список файлов из БД в модель Slint.
 fn items_from(list: Vec<db::GalleryFile>, thumbs: &Path) -> Vec<FileItem> {
     list.into_iter()
@@ -48,6 +56,8 @@ fn items_from(list: Vec<db::GalleryFile>, thumbs: &Path) -> Vec<FileItem> {
                 .into_owned()
                 .into(),
             is_video: f.is_video,
+            height: fmt_dim(f.height),
+            width: fmt_dim(f.width),
         })
         .collect()
 }

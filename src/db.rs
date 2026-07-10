@@ -101,6 +101,9 @@ pub struct GalleryFile {
     pub name: String,
     pub is_video: bool,
     pub rel_path: String,
+    // None, если ещё не отсканировано (NULL). Может быть -1 — «не определить».
+    pub height: Option<i64>,
+    pub width: Option<i64>,
 }
 
 /// Ключ сортировки галереи. Индексы совпадают с порядком меню в UI.
@@ -288,7 +291,7 @@ impl Db {
     ) -> rusqlite::Result<Vec<GalleryFile>> {
         use rusqlite::types::Value;
         let mut sql = String::from(
-            "SELECT f.id, f.name, f.media_type, f.rel_path FROM files f WHERE f.is_deleted = 0",
+            "SELECT f.id, f.name, f.media_type, f.rel_path, f.width, f.height FROM files f WHERE f.is_deleted = 0",
         );
         let mut params: Vec<Value> = Vec::new();
 
@@ -345,6 +348,8 @@ impl Db {
                 name: r.get(1)?,
                 is_video: mt == 1,
                 rel_path: r.get(3)?,
+                width: r.get(4)?,
+                height: r.get(5)?
             })
         })?;
         rows.collect()
@@ -410,6 +415,28 @@ impl Db {
         self.conn.execute(
             "UPDATE files SET duration_ms = ?2 WHERE id = ?1",
             params![id, ms],
+        )?;
+        Ok(())
+    }
+
+    // --- Разрешение медиа (фоновый проход) ---
+
+    /// Файлы без заполненного разрешения (height IS NULL).
+    pub fn item_without_resolution(&self, limit: i64) -> rusqlite::Result<Vec<(i64, String, bool)>> {
+        // media_type: 0=image, 1=video → читаем как bool (is_video).
+        let mut stmt = self.conn.prepare(
+            "SELECT id, rel_path, media_type FROM files
+              WHERE height IS NULL AND is_deleted = 0
+              LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+
+    pub fn set_resolution(&self, id: i64, height: i64, width: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE files SET height = ?2, width = ?3 WHERE id = ?1",
+            params![id, height, width],
         )?;
         Ok(())
     }
