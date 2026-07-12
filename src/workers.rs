@@ -1,4 +1,4 @@
-//! Полный проход обработки медиатеки: индексация → превью → хеш → длительность.
+//! Полный проход обработки медиатеки: индексация → хеш → превью → длительность.
 //!
 //! Одноразовая функция `reindex` запускается в фоновом потоке при старте и по
 //! кнопке «Обновить». Обрабатывает ВСЕ подходящие файлы (пачками, пока не
@@ -20,7 +20,7 @@ const VIDEO_THUMB_PERCENT: u32 = 20;
 const THUMB_OK: i64 = 1;
 const THUMB_ERR: i64 = 2;
 
-/// Полный проход: индексация media/ → превью → контент-хэш → длительность.
+/// Полный проход: индексация media/ → контент-хэш → превью → длительность.
 /// `on_update` вызывается после скана и после каждой пачки превью, чтобы UI
 /// подхватывал новые файлы и миниатюры по мере готовности.
 pub fn reindex(db_path: &Path, media: &Path, thumbs: &Path, on_update: impl Fn()) {
@@ -35,9 +35,10 @@ pub fn reindex(db_path: &Path, media: &Path, thumbs: &Path, on_update: impl Fn()
     // 1. Индексация файловой системы.
     match crate::scanner::scan(media, &db) {
         Ok(s) => log::info!(
-            "Скан: добавлено {}, обновлено {}, удалено {} (на месте {})",
+            "Скан: добавлено {}, обновлено {}, переехало {}, удалено {} (на месте {})",
             s.added,
             s.updated,
+            s.renamed,
             s.deleted,
             s.seen
         ),
@@ -45,7 +46,33 @@ pub fn reindex(db_path: &Path, media: &Path, thumbs: &Path, on_update: impl Fn()
     }
     on_update();
 
-    // 2. Миниатюры — все, пачками (ошибочные помечаются и выпадают).
+    // 2. Контент-хэш — все. Идёт ПЕРЕД превью: хэш — единственное, чем скан
+    //    может подтвердить переезд файла (сам файл к тому моменту уже пропал),
+    //    поэтому чем раньше библиотека прохэширована, тем строже рематч.
+    //    При стойкой ошибке (файл пропал) пачка не даёт прогресса → выходим,
+    //    чтобы не зациклиться (хэш остаётся NULL).
+    loop {
+        let batch = db.files_without_hash(BATCH).unwrap_or_default();
+        if batch.is_empty() {
+            break;
+        }
+        let mut progressed = false;
+        for (id, rel) in batch {
+            let src = media.join(&rel);
+            match hash_file(&src) {
+                Ok(h) => {
+                    let _ = db.set_hash(id, h);
+                    progressed = true;
+                }
+                Err(e) => log::warn!("Хэш {rel}: {e}"),
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    // 3. Миниатюры — все, пачками (ошибочные помечаются и выпадают).
     loop {
         let batch = db.files_needing_thumb(BATCH).unwrap_or_default();
         if batch.is_empty() {
@@ -79,29 +106,6 @@ pub fn reindex(db_path: &Path, media: &Path, thumbs: &Path, on_update: impl Fn()
             }
         }
         on_update();
-    }
-
-    // 3. Контент-хэш — все. При стойкой ошибке (файл пропал) пачка не даёт
-    //    прогресса → выходим, чтобы не зациклиться (хэш остаётся NULL).
-    loop {
-        let batch = db.files_without_hash(BATCH).unwrap_or_default();
-        if batch.is_empty() {
-            break;
-        }
-        let mut progressed = false;
-        for (id, rel) in batch {
-            let src = media.join(&rel);
-            match hash_file(&src) {
-                Ok(h) => {
-                    let _ = db.set_hash(id, h);
-                    progressed = true;
-                }
-                Err(e) => log::warn!("Хэш {rel}: {e}"),
-            }
-        }
-        if !progressed {
-            break;
-        }
     }
 
     // 4. Длительность видео — все (None → -1 sentinel, чтобы не пробовать вечно).
@@ -188,7 +192,7 @@ pub(crate) fn make_image_thumb(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// Потоковый xxh3 содержимого файла.
-fn hash_file(path: &Path) -> std::io::Result<u64> {
+pub(crate) fn hash_file(path: &Path) -> std::io::Result<u64> {
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Xxh3::new();
     let mut buf = [0u8; 64 * 1024];

@@ -87,6 +87,20 @@ pub struct ActiveFile {
     pub rel_path: String,
     pub size: i64,
     pub mtime: i64,
+    /// NULL, если фоновый хэшер до файла ещё не дошёл.
+    pub hash: Option<i64>,
+}
+
+/// Переезд существующей записи на новый путь (файл переименовали/переместили).
+/// Сохраняем id — а значит теги, resume_ms, added_at и миниатюру {id}.jpg.
+pub struct RenameFile<'a> {
+    pub id: i64,
+    pub rel_path: &'a str,
+    pub name: &'a str,
+    pub ext: &'a str,
+    pub media_type: MediaType,
+    pub size: i64,
+    pub mtime: i64,
 }
 
 /// Тег.
@@ -220,7 +234,7 @@ impl Db {
     /// Все живые записи (для сверки с содержимым диска).
     pub fn active_files(&self) -> rusqlite::Result<Vec<ActiveFile>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, rel_path, size, mtime FROM files WHERE is_deleted = 0",
+            "SELECT id, rel_path, size, mtime, hash FROM files WHERE is_deleted = 0",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(ActiveFile {
@@ -228,9 +242,44 @@ impl Db {
                 rel_path: r.get(1)?,
                 size: r.get(2)?,
                 mtime: r.get(3)?,
+                hash: r.get(4)?,
             })
         })?;
         rows.collect()
+    }
+
+    /// Переносит записи на новые пути одной транзакцией.
+    ///
+    /// Конфликт с `idx_files_active_path` здесь невозможен: цель переезда —
+    /// путь файла, который есть на диске, а такой путь не может принадлежать
+    /// другой живой записи (её бы нашли по пути ещё в первой фазе скана).
+    ///
+    /// hash/thumb_state/added_at/resume_ms и теги не трогаем: содержимое то же.
+    pub fn apply_renames(&self, renames: &[RenameFile]) -> rusqlite::Result<()> {
+        if renames.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE files
+                    SET rel_path = ?2, name = ?3, ext = ?4, media_type = ?5,
+                        size = ?6, mtime = ?7
+                  WHERE id = ?1",
+            )?;
+            for r in renames {
+                stmt.execute(params![
+                    r.id,
+                    r.rel_path,
+                    r.name,
+                    r.ext,
+                    r.media_type as i64,
+                    r.size,
+                    r.mtime,
+                ])?;
+            }
+        }
+        tx.commit()
     }
 
     /// Вставляет новый файл, возвращает id.
