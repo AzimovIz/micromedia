@@ -103,6 +103,15 @@ pub struct RenameFile<'a> {
     pub mtime: i64,
 }
 
+/// Этап фоновой обработки — для подсчёта оставшейся работы.
+#[derive(Clone, Copy)]
+pub enum Pending {
+    Hash,
+    Thumb,
+    Duration,
+    Resolution,
+}
+
 /// Тег.
 pub struct Tag {
     pub id: i64,
@@ -402,6 +411,21 @@ impl Db {
             })
         })?;
         rows.collect()
+    }
+
+    /// Сколько живых файлов ещё ждёт этого этапа обработки — для прогресса в логе.
+    pub fn count_pending(&self, kind: Pending) -> rusqlite::Result<i64> {
+        let cond = match kind {
+            Pending::Hash => "hash IS NULL",
+            Pending::Thumb => "thumb_state IN (0, 3)",
+            Pending::Duration => "media_type = 1 AND duration_ms IS NULL",
+            Pending::Resolution => "height IS NULL",
+        };
+        self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM files WHERE is_deleted = 0 AND ({cond})"),
+            [],
+            |r| r.get(0),
+        )
     }
 
     pub fn file_count(&self) -> rusqlite::Result<i64> {
