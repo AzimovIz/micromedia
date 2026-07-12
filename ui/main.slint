@@ -1686,7 +1686,7 @@ export component MainWindow inherits Window {
 
             // Справа: сделать текущий кадр видео миниатюрой файла.
             if root.viewer-is-video: Rectangle {
-                x: parent.width - self.width - 8px;
+                x: parent.width - self.width - 8px - 50px;
                 y: 8px;
                 width: 156px;
                 height: 30px;
@@ -1702,6 +1702,16 @@ export component MainWindow inherits Window {
                 sett-ta := TouchArea {
                     clicked => { root.viewer-set-thumbnail(); }
                 }
+            }
+
+            CtrlBtn {
+                x: parent.width - self.width - 8px;
+                y: 8px;
+                label: "✕";
+                height: 30px;
+                fsize: 16px;
+                w: 44px;
+                clicked => { root.viewer-close(); }
             }
         }
 
@@ -1825,12 +1835,6 @@ export component MainWindow inherits Window {
                     label: root.viewer-fullscreen ? "🗗" : "⛶";
                     fsize: 15px;
                     clicked => { root.viewer-toggle-fullscreen(); }
-                }
-                CtrlBtn {
-                    label: "✕";
-                    fsize: 16px;
-                    w: 44px;
-                    clicked => { root.viewer-close(); }
                 }
             }
         }
