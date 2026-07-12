@@ -66,7 +66,17 @@ pub fn reindex(db_path: &Path, media: &Path, thumbs: &Path, on_update: impl Fn()
     }
     on_update();
 
-    // 2. Миниатюры — все, пачками (ошибочные помечаются и выпадают).
+    // 2. Миниатюры — все, пачками (ошибочные помечаются и выпадают до следующего
+    //    прохода: очередь пересобирается ниже, чтобы разовый сбой не оставлял
+    //    файл без превью навсегда).
+    match db.requeue_broken_thumbs(thumbs) {
+        Ok((0, 0)) => {}
+        Ok((failed, missing)) => log::info!(
+            "Превью: возвращаю в очередь {failed} с прошлой ошибкой и {missing} с пропавшим файлом"
+        ),
+        Err(e) => log::warn!("Превью: не удалось пересобрать очередь — {e}"),
+    }
+
     let total = db.count_pending(Pending::Thumb).unwrap_or(0);
     log::info!("Превью: нужно сделать {total}");
     let t = Instant::now();

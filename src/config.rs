@@ -10,6 +10,9 @@ pub struct Config {
     pub sort_index: i32,
     pub filter_text: String,
     pub volume: f32,
+    /// Программный GL (llvmpipe). Ставится автоматически, если аппаратный
+    /// оказался нерабочим, — чтобы следующий запуск сразу шёл верным путём.
+    pub software_gl: bool,
 }
 
 impl Default for Config {
@@ -18,6 +21,7 @@ impl Default for Config {
             sort_index: 0,
             filter_text: String::new(),
             volume: 100.0,
+            software_gl: false,
         }
     }
 }
@@ -50,6 +54,7 @@ impl Config {
                     }
                 }
                 "filter_text" => cfg.filter_text = unquote(val),
+                "software_gl" => cfg.software_gl = val == "true",
                 _ => {}
             }
         }
@@ -59,10 +64,11 @@ impl Config {
     /// Атомарно пишет конфиг (tmp + rename).
     pub fn save(&self, path: &Path) {
         let body = format!(
-            "sort_index = {}\nvolume = {}\nfilter_text = \"{}\"\n",
+            "sort_index = {}\nvolume = {}\nfilter_text = \"{}\"\nsoftware_gl = {}\n",
             self.sort_index,
             self.volume,
             escape(&self.filter_text),
+            self.software_gl,
         );
         let tmp = path.with_extension("toml.tmp");
         if std::fs::write(&tmp, body).is_ok() {

@@ -533,6 +533,40 @@ impl Db {
         rows.collect()
     }
 
+    /// Возвращает в очередь превью, которые (а) помечены ошибкой или (б) числятся
+    /// готовыми, но файла миниатюры нет на диске.
+    ///
+    /// Без этого одна неудача (сломанная libmpv, почищенная папка thumbnails)
+    /// оставалась в БД навсегда: state 2 и 1 не попадают в `files_needing_thumb`,
+    /// и превью не пересоздавалось уже никогда — даже когда причина сбоя ушла.
+    ///
+    /// Возвращает (сколько было с ошибкой, сколько с пропавшим файлом).
+    pub fn requeue_broken_thumbs(&self, thumbs: &Path) -> rusqlite::Result<(usize, usize)> {
+        let failed = self.conn.execute(
+            "UPDATE files SET thumb_state = 0 WHERE thumb_state = 2 AND is_deleted = 0",
+            [],
+        )?;
+
+        let ids: Vec<i64> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM files WHERE thumb_state = 1 AND is_deleted = 0")?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+
+        let mut missing = 0usize;
+        for id in ids {
+            if !thumbs.join(format!("{id}.jpg")).is_file() {
+                self.conn
+                    .execute("UPDATE files SET thumb_state = 0 WHERE id = ?1", [id])?;
+                missing += 1;
+            }
+        }
+
+        Ok((failed, missing))
+    }
+
     pub fn set_thumb_state(&self, id: i64, state: i64) -> rusqlite::Result<()> {
         self.conn.execute(
             "UPDATE files SET thumb_state = ?2 WHERE id = ?1",

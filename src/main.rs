@@ -3,6 +3,7 @@
 #[allow(dead_code)] // API дозревает вместе со сканером/тегами
 mod config;
 mod db;
+mod graphics;
 mod media;
 #[allow(dead_code)] // часть mpv-методов пригодится позже
 mod mpv;
@@ -259,6 +260,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui_db.file_count()?
     );
 
+    // Загрузка сохранённого состояния (сортировка, поиск тегов, громкость, GL).
+    // Читаем ДО создания окна: решение о программном GL нужно принять раньше,
+    // чем Slint инициализирует драйвер (Mesa читает переменные при старте GL).
+    let cfg = config::Config::load(&paths.config);
+    let gl_mode = graphics::setup(cfg.software_gl);
+
     // Загрузка mpv (для просмотрщика видео).
     let mpv_opt: Option<Rc<Mpv>> = match Mpv::load() {
         Ok(m) => Some(Rc::new(m)),
@@ -291,8 +298,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect(),
     ));
 
-    // Загрузка сохранённого состояния (сортировка, поиск тегов, громкость).
-    let cfg = config::Config::load(&paths.config);
     window.set_sort_index(cfg.sort_index);
     window.set_filter_text(cfg.filter_text.clone().into());
     window.set_viewer_volume(cfg.volume);
@@ -300,16 +305,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mpv.set_volume(cfg.volume as f64);
     }
 
+    // Режим GL запоминаем в конфиге: если аппаратный оказался нерабочим, следующий
+    // запуск сразу идёт программным путём, без лишнего перезапуска.
+    let software_gl = Rc::new(Cell::new(gl_mode.software));
+
     // Сохранение состояния (вызываем при изменении сортировки/фильтра/громкости).
     let save_config: Rc<dyn Fn()> = {
         let weak = window.as_weak();
         let config_path = paths.config.clone();
+        let software_gl = software_gl.clone();
         Rc::new(move || {
             if let Some(w) = weak.upgrade() {
                 config::Config {
                     sort_index: w.get_sort_index(),
                     filter_text: w.get_filter_text().to_string(),
                     volume: w.get_viewer_volume(),
+                    software_gl: software_gl.get(),
                 }
                 .save(&config_path);
             }
@@ -1553,8 +1564,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let dst = thumbs.join(format!("{id}.jpg"));
-            let tmp = thumbs.join(format!("{id}.cap.jpg"));
-            // Быстрый снимок текущего кадра во временный JPEG (энкод одного кадра).
+            // PNG, а не JPEG: сохранение в JPEG требует, чтобы libmpv была собрана
+            // с libjpeg, а портативная сборка идёт без него (docs/build-libmpv.md).
+            // PNG mpv умеет через zlib, который есть в любой сборке. В JPEG-миниатюру
+            // кадр всё равно перекодирует make_image_thumb.
+            let tmp = thumbs.join(format!("{id}.cap.png"));
+            // Быстрый снимок текущего кадра во временный файл (энкод одного кадра).
             if let Err(e) = mpv.screenshot_to_file(&tmp.to_string_lossy()) {
                 log::error!("{e}");
                 return;
@@ -1629,6 +1644,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- mpv-пайплайн (render API под UI) ---
+    // Ставится, если GL-контекст окажется аварийным: тогда выходим из цикла
+    // событий и перезапускаемся с программным GL (см. конец main).
+    let restart_software_gl = Rc::new(Cell::new(false));
+
     if let Some(mpv) = mpv_opt.clone() {
         let render_ctx: Rc<Cell<*mut MpvRenderContext>> = Rc::new(Cell::new(std::ptr::null_mut()));
         let weak_box: *mut slint::Weak<MainWindow> = Box::into_raw(Box::new(window.as_weak()));
@@ -1637,12 +1656,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let notifier_ctx = render_ctx.clone();
         let weak_for_redraw = window.as_weak();
         let gate = render_video.clone();
+        let can_fall_back = gl_mode.can_fall_back();
+        let restart_flag = restart_software_gl.clone();
 
         let res = window
             .window()
             .set_rendering_notifier(move |state, api| match state {
                 RenderingState::RenderingSetup => {
                     if let GraphicsAPI::NativeOpenGL { get_proc_address } = api {
+                        // Чем нам достался GL: на сломанном стеке Mesa контекст
+                        // создаётся, но рендер mpv в FBO даёт чёрный кадр — ловим
+                        // это по строке GL_RENDERER и уходим на программный путь.
+                        if let Some(info) = unsafe { graphics::probe(*get_proc_address) } {
+                            log::info!(
+                                "GL: {} | {} | {}",
+                                info.renderer,
+                                info.vendor,
+                                info.version
+                            );
+                            if info.looks_broken() && can_fall_back {
+                                log::warn!(
+                                    "GL: контекст выглядит нерабочим ({}) — перезапускаюсь с программным рендерингом",
+                                    info.renderer
+                                );
+                                restart_flag.set(true);
+                                let _ = slint::quit_event_loop();
+                                return;
+                            }
+                        }
+
                         match unsafe { notifier_mpv.create_render_context(*get_proc_address) } {
                             Ok(ctx) => {
                                 notifier_ctx.set(ctx);
@@ -1685,6 +1727,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     window.run()?;
+
+    // Аварийный GL: запоминаем выбор и стартуем заново уже программным путём.
+    // Именно перезапуском, а не переключением на лету: Mesa читает
+    // LIBGL_ALWAYS_SOFTWARE при инициализации драйвера, менять его в живом
+    // процессе поздно.
+    if restart_software_gl.get() {
+        software_gl.set(true);
+        save_config();
+        return graphics::restart_software().map_err(Into::into);
+    }
 
     // Финальное сохранение состояния при выходе.
     save_config();
