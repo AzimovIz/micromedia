@@ -495,6 +495,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     rebuild_gallery();
 
+    // Masonry-раскладка плитки: жадный алгоритм «в самую короткую колонку»
+    // по реальным пропорциям файла (пока разрешение не определено — квадрат).
+    window.on_compute_masonry(|container_width, gap, columns, files| {
+        let columns = columns.max(1) as usize;
+        let col_width = ((container_width - gap * (columns as f32 + 1.0)) / columns as f32).max(1.0);
+        let mut col_heights = vec![gap; columns];
+        let mut positions = Vec::with_capacity(files.row_count());
+        for item in files.iter() {
+            let w: f32 = item.width.parse().unwrap_or(0.0);
+            let h: f32 = item.height.parse().unwrap_or(0.0);
+            let aspect = if w > 0.0 && h > 0.0 { h / w } else { 1.0 };
+            let tile_height = (col_width * aspect).max(1.0);
+            let (col, &y) = col_heights
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap();
+            let x = gap + col as f32 * (col_width + gap);
+            positions.push(TileLayout {
+                x,
+                y,
+                width: col_width,
+                height: tile_height,
+            });
+            col_heights[col] = y + tile_height + gap;
+        }
+        let height = col_heights.iter().cloned().fold(0.0f32, f32::max);
+        MasonryResult {
+            positions: ModelRc::new(VecModel::from(positions)),
+            height,
+        }
+    });
+
     // Ленивая подгрузка миниатюр с кэшем (промахи не кэшируем).
     let thumb_cache: Rc<RefCell<HashMap<String, slint::Image>>> =
         Rc::new(RefCell::new(HashMap::new()));

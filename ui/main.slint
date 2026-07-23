@@ -20,6 +20,18 @@ export struct TagItem {
     name: string,
 }
 
+export struct TileLayout {
+    x: length,
+    y: length,
+    width: length,
+    height: length,
+}
+
+export struct MasonryResult {
+    positions: [TileLayout],
+    height: length,
+}
+
 export struct TreeRow {
     label: string,
     depth: int,
@@ -128,7 +140,11 @@ export component MainWindow inherits Window {
     in-out property <float> cols-slider: 6;
     property <int> columns: Math.max(1, Math.round(root.cols-slider));
     property <length> gap: 8px;
-    property <length> cell-size: (flick.width - root.gap * (root.columns + 1)) / root.columns;
+    // Masonry-раскладка плитки: считается в Rust (алгоритм «в самую короткую
+    // колонку») из реальных пропорций файла — Slint не умеет в мутируемые
+    // локальные массивы, нужные для такого расчёта.
+    pure callback compute-masonry(length, length, int, [FileItem]) -> MasonryResult;
+    property <MasonryResult> masonry: root.compute-masonry(flick.width, root.gap, root.columns, root.files);
 
     pure callback load-thumb(string) -> image;
     callback open-file(int);
@@ -649,14 +665,14 @@ export component MainWindow inherits Window {
                 width: 100%;
                 height: 100%;
                 viewport-width: self.width;
-                viewport-height: Math.ceil(root.files.length / root.columns) * (root.cell-size + root.gap) + root.gap;
+                viewport-height: root.masonry.height;
 
                 for item[idx] in root.files: Rectangle {
-                    property <int> cell-row: Math.floor(idx / root.columns);
-                    x: root.gap + (idx - self.cell-row * root.columns) * (root.cell-size + root.gap);
-                    y: root.gap + self.cell-row * (root.cell-size + root.gap);
-                    width: root.cell-size;
-                    height: root.cell-size;
+                    property <TileLayout> lay: root.masonry.positions[idx];
+                    x: self.lay.x;
+                    y: self.lay.y;
+                    width: self.lay.width;
+                    height: self.lay.height;
                     background: cell-ta.has-hover ? #30303a : #26262e;
                     border-radius: 6px;
                     clip: true;
