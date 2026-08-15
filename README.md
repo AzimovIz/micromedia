@@ -1,97 +1,104 @@
 # MicroMedia
 
-Портативный десктопный просмотрщик видео и изображений.
+*[Читать на русском](README_RU.md)*
 
-**Скачать:** https://github.com/AzimovIz/micromedia/releases/latest
-(Windows x86_64 и Linux x86_64).
+Portable desktop viewer for video and images.
 
-> Для воспроизведения видео нужна **libmpv**. Если mpv установлен в системе —
-> берётся он. Иначе положите `libmpv.so` (Linux) / `libmpv-2.dll` (Windows) в
-> `appdata/libs/` рядом с бинарником (в архиве есть файл-подсказка).
+**Download:** https://github.com/AzimovIz/micromedia/releases/latest
+(Windows x86_64 and Linux x86_64).
+
+> Video playback requires **libmpv**. If mpv is installed on the system, it
+> will be used automatically. Otherwise, place `libmpv.so` (Linux) /
+> `libmpv-2.dll` (Windows) in `appdata/libs/` next to the binary (the archive
+> includes a hint file).
 
 
-> **Если в программе пусто** - положите свои медиа в папку `media` рядом 
-> с бинарником и нажмите на кнопку пересканирования сверху справа.
+> **If the app is empty** - put your media files into the `media` folder
+> next to the binary and click the rescan button in the top-right corner.
 
 ---
 
-## Скриншоты
+## Screenshots
 
-| Библиотека | Список |
+| Library | List |
 |---|---|
-| ![Библиотека](assets/main.png) | ![Список](assets/list_view.png) |
+| ![Library](assets/main.png) | ![List](assets/list_view.png) |
 
-| Плеер | Теги |
+| Player | Tags |
 |---|---|
-| ![Плеер](assets/player.png) | ![Теги](assets/tag_edit.png) |
+| ![Player](assets/player.png) | ![Tags](assets/tag_edit.png) |
 
 ---
 
-## Возможности
+## Features
 
-### Библиотека
-- Сканирование папки `media/` и индексация в фоне (SQLite).
-- Галерея-плитка с миниатюрами; слайдер числа колонок.
-- Вид **«Список»** — древовидная структура папок, как в проводнике.
-- Кнопка «Обновить» — переиндексация: скан → миниатюры → хеш → длительность.
-  Ход работы виден в логе (`RUST_LOG=info`, уровень по умолчанию).
-- Переименование и перемещение файлов распознаётся: запись переезжает на новый
-  путь, сохраняя теги, позицию воспроизведения и миниатюру.
-- Фоновая генерация превью (картинки — нативно, видео — кадр через mpv).
+### Library
+- Scans the `media/` folder and indexes it in the background (SQLite).
+- Tile gallery with thumbnails; slider for the number of columns.
+- **"List"** view — a tree-like folder structure, like in a file explorer.
+- "Refresh" button — reindexing: scan → thumbnails → hash → duration.
+  Progress is visible in the log (`RUST_LOG=info`, default level).
+- File renames and moves are detected: the record moves to the new path,
+  keeping tags, playback position, and thumbnail.
+- Background preview generation (images — natively, video — a frame via mpv).
 
-### Просмотрщик
-- Оверлей-лайтбокс поверх галереи для фото и видео.
-- **Зум колесом мыши**, перемещение — ЛКМ, сброс — средняя кнопка (фото и видео).
-- Анимированные **GIF** (проигрываются через mpv, с зацикливанием).
+### Viewer
+- Overlay lightbox on top of the gallery for photos and videos.
+- **Mouse-wheel zoom**, pan with left click, reset with middle click (photos
+  and videos).
+- Animated **GIFs** (played via mpv, with looping).
 
-### Видео-плеер
-- Play/pause, перемотка, скипы ±5/±10 с, покадровый шаг.
-- Скорость 0.5–2×, луп, громкость, mute, время `m:ss`.
-- Полноэкранный режим с авто-скрытием контролов (появляются по движению мыши).
-- Демукс-кэш в RAM — плавное воспроизведение даже с медленной флешки.
-- **Set as thumbnail** — сделать текущий кадр миниатюрой файла.
-- Клавиши: `Space` — пауза, `←/→` — ±5 с, `F` — фуллскрин, `Esc` — выход.
+### Video player
+- Play/pause, seeking, ±5/±10 s skips, frame-by-frame step.
+- Speed 0.5–2×, loop, volume, mute, `m:ss` time display.
+- Fullscreen mode with auto-hiding controls (appear on mouse movement).
+- RAM demux cache — smooth playback even from a slow flash drive.
+- **Set as thumbnail** — make the current frame the file's thumbnail.
+- Keys: `Space` — pause, `←/→` — ±5 s, `F` — fullscreen, `Esc` — exit.
 
-### Организация и поиск
-- **Теги**: назначение/снятие, автодополнение, массовое тегирование по выбору.
-  Осиротевшие теги (без файлов) удаляются автоматически.
-- **Фильтр по тегам** - строка `tag1 -tag2` (минус исключает).
-- Алфавитный список тегов с кнопками `+` / `−` (включить / исключить).
-- **Поиск по имени файла** и **фильтр по типу** (фото / видео).
-- **Сортировки**: имя, дата добавления, дата файла, размер, тип, длительность.
+### Organization and search
+- **Tags**: assign/remove, autocomplete, bulk tagging for a selection.
+  Orphaned tags (with no files) are removed automatically.
+- **Tag filter** - string like `tag1 -tag2` (minus excludes).
+- Alphabetical tag list with `+` / `−` buttons (include / exclude).
+- **Search by file name** and **filter by type** (photo / video).
+- **Sorting**: name, date added, file date, size, type, duration.
 
-### Список и массовые операции
-- Мультивыбор флажками; выделение папки каскадит на вложенные файлы.
-- ПКМ по выбранному: добавить/удалить теги, удалить с диска (с подтверждением).
-- ПКМ по невыбранному: «Открыть расположение» в системном файловом менеджере.
+### List and bulk operations
+- Multi-select via checkboxes; selecting a folder cascades to its nested
+  files.
+- Right-click on a selected item: add/remove tags, delete from disk (with
+  confirmation).
+- Right-click on an unselected item: "Open location" in the system file
+  manager.
 
-### Прочее
-- Сохранение состояния (`appdata/config.toml`): сортировка, поиск по тегам,
-  громкость видео.
-- Регулируемая ширина боковой панели (перетаскиваемая граница).
+### Other
+- State persistence (`appdata/config.toml`): sorting, tag search, video
+  volume.
+- Adjustable sidebar width (draggable border).
 
 ---
 
-## Раскладка данных
+## Data layout
 
 ```text
 micromedia            # micromedia / micromedia.exe
-media/                # ваши медиафайлы (индексируются отсюда)
+media/                # your media files (indexed from here)
 appdata/
-  micromedia.db       # SQLite: файлы, теги, метаданные
-  thumbnails/         # кэш миниатюр
-  libs/               # libmpv.so / libmpv-2.dll (если нет системного mpv)
-  config.toml         # сохранённые настройки
+  micromedia.db       # SQLite: files, tags, metadata
+  thumbnails/         # thumbnail cache
+  libs/               # libmpv.so / libmpv-2.dll (if no system mpv)
+  config.toml         # saved settings
 ```
 
-Положите файлы в `media/` и нажмите «Обновить» (или перезапустите).
+Put your files into `media/` and click "Refresh" (or restart the app).
 
 ---
 
-## Сборка
+## Build
 
-Rust + [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) (для
-переносимого glibc 2.17). На Linux нужен `libfontconfig-dev`.
+Rust + [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) (for
+portable glibc 2.17). On Linux you need `libfontconfig-dev`.
 
 ```sh
 # Linux (glibc 2.17)
@@ -102,10 +109,10 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 
 ---
 
-## Технологии
+## Tech stack
 
 Rust · [Slint](https://slint.dev) (GL/femtovg) · [mpv](https://mpv.io) · SQLite (rusqlite).
 
 
-## Создано с помощью Claude
-Этот проект был практически полностью написан Claude (ИИ-ассистентом от Anthropic) с использованием Claude Code при участии разработчика-человека, который задавал направление работы, проводил тестирование и давал обратную связь. Всё — от архитектуры до реализации (код на Rust, пользовательский интерфейс, интеграция с libmpv, схема базы данных SQLite, фоновое сканирование) — было создано Claude.
+## Built with Claude
+This project was almost entirely written by Claude (Anthropic's AI assistant) using Claude Code, with a human developer setting direction, testing, and giving feedback. Everything — from architecture to implementation (Rust code, UI, libmpv integration, SQLite database schema, background scanning) — was created by Claude.
