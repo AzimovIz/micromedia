@@ -232,6 +232,28 @@ fn fmt_time(secs: f64) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
+/// Форматирует миллисекунды в m:ss (для полей таймкода редактора фрагментов).
+fn fmt_mmss(ms: i64) -> String {
+    fmt_time(ms as f64 / 1000.0)
+}
+
+/// Разбирает таймкод вида "m:ss" / "h:mm:ss" в миллисекунды. `None`, если формат некорректен.
+fn parse_mmss(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.trim().split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut secs: i64 = 0;
+    for p in &parts {
+        let v: i64 = p.trim().parse().ok()?;
+        if v < 0 {
+            return None;
+        }
+        secs = secs * 60 + v;
+    }
+    Some(secs * 1000)
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -329,6 +351,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Состояние ---
     let current_open_id: Rc<Cell<i64>> = Rc::new(Cell::new(-1));
+    // Фрагменты открытого видео: кэш для проверки пересечений и заполнения
+    // редактора (без похода в БД на каждый клик).
+    let current_fragments: Rc<RefCell<Vec<db::Fragment>>> = Rc::new(RefCell::new(Vec::new()));
+    // Стартовая точка разметки (мс), пока не нажата «Конец фрагмента».
+    let frag_marking_start: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(None));
+    // id редактируемого фрагмента в оверлее метаданных; -1 = создание нового.
+    let frag_editing_id: Rc<Cell<i64>> = Rc::new(Cell::new(-1));
+    // id фрагмента, ожидающего подтверждения удаления.
+    let frag_delete_target: Rc<Cell<i64>> = Rc::new(Cell::new(-1));
     // Мультивыбор (вид «Список»): выбранные id, раскрытые папки, зеркало дерева.
     let selected: Rc<RefCell<std::collections::HashSet<i64>>> =
         Rc::new(RefCell::new(std::collections::HashSet::new()));
@@ -442,6 +473,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect();
                 w.set_viewer_tags(ModelRc::new(VecModel::from(items)));
             }
+        })
+    };
+
+    // Фрагменты открытого видео: обновляет кэш + модель для полоски/оверлея.
+    let rebuild_viewer_fragments: Rc<dyn Fn(i64)> = {
+        let weak = window.as_weak();
+        let ui_db = ui_db.clone();
+        let current_fragments = current_fragments.clone();
+        Rc::new(move |id: i64| {
+            let list = ui_db.fragments_for_file(id).unwrap_or_default();
+            if let Some(w) = weak.upgrade() {
+                let items: Vec<FragmentItem> = list
+                    .iter()
+                    .map(|f| FragmentItem {
+                        id: f.id as i32,
+                        start: f.start_ms as f32 / 1000.0,
+                        end: f.end_ms as f32 / 1000.0,
+                        title: f.title.clone().into(),
+                    })
+                    .collect();
+                w.set_viewer_fragments(ModelRc::new(VecModel::from(items)));
+            }
+            *current_fragments.borrow_mut() = list;
         })
     };
 
@@ -1160,6 +1214,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let render_video = render_video.clone();
         let current = current_open_id.clone();
         let rebuild_viewer_tags = rebuild_viewer_tags.clone();
+        let rebuild_viewer_fragments = rebuild_viewer_fragments.clone();
+        let frag_marking_start = frag_marking_start.clone();
         let loop_on = loop_on.clone();
         Rc::new(move |id: i32| {
             let Some(w) = weak.upgrade() else { return };
@@ -1168,6 +1224,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let full = media.join(&rel);
                     current.set(id as i64);
                     rebuild_viewer_tags(id as i64);
+                    rebuild_viewer_fragments(id as i64);
+                    // Смена файла отменяет незавершённую разметку фрагмента.
+                    frag_marking_start.set(None);
+                    w.set_frag_marking(false);
                     w.set_add_tag_text("".into());
                     w.set_add_tag_suggestions(strings_model(Vec::new()));
                     w.set_viewer_name(basename(&rel).into());
@@ -1636,6 +1696,191 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // --- Фрагменты видео ---
+
+    // Диапазон [start_ms,end_ms) не должен пересекать/включать ни один
+    // существующий фрагмент. `skip_id` — исключить сам редактируемый
+    // фрагмент (-1 при создании нового).
+    fn frag_overlaps(
+        fragments: &[db::Fragment],
+        start_ms: i64,
+        end_ms: i64,
+        skip_id: i64,
+    ) -> bool {
+        fragments
+            .iter()
+            .any(|f| f.id != skip_id && f.start_ms < end_ms && start_ms < f.end_ms)
+    }
+
+    // Клик по кнопке «Начало фрагмента» / «Конец фрагмента».
+    {
+        let weak = window.as_weak();
+        let mpv = mpv_opt.clone();
+        let frag_marking_start = frag_marking_start.clone();
+        let frag_editing_id = frag_editing_id.clone();
+        let current_fragments = current_fragments.clone();
+        window.on_frag_mark_clicked(move || {
+            let Some(w) = weak.upgrade() else { return };
+            let Some(mpv) = &mpv else { return };
+            let pos_ms = (mpv.get_double("time-pos").unwrap_or(0.0) * 1000.0) as i64;
+
+            match frag_marking_start.get() {
+                None => {
+                    frag_marking_start.set(Some(pos_ms));
+                    w.set_frag_marking(true);
+                }
+                Some(start_ms) => {
+                    frag_marking_start.set(None);
+                    w.set_frag_marking(false);
+                    let end_ms = pos_ms;
+                    let invalid = end_ms <= start_ms
+                        || frag_overlaps(&current_fragments.borrow(), start_ms, end_ms, -1);
+                    if invalid {
+                        w.set_frag_error_text("Invalid range: end is before start, or it overlaps another fragment.".into());
+                        w.set_frag_error_open(true);
+                        return;
+                    }
+                    frag_editing_id.set(-1);
+                    w.set_frag_editor_heading("New fragment".into());
+                    w.set_frag_editor_title_text("".into());
+                    w.set_frag_editor_start_text(fmt_mmss(start_ms).into());
+                    w.set_frag_editor_end_text(fmt_mmss(end_ms).into());
+                    w.set_frag_editor_open(true);
+                }
+            }
+        });
+    }
+
+    // Сохранение оверлея метаданных: и для создания, и для редактирования
+    // (поля start/end тоже редактируемые — валидация здесь же, повторно).
+    {
+        let weak = window.as_weak();
+        let ui_db = ui_db.clone();
+        let current = current_open_id.clone();
+        let frag_editing_id = frag_editing_id.clone();
+        let current_fragments = current_fragments.clone();
+        let rebuild_viewer_fragments = rebuild_viewer_fragments.clone();
+        window.on_frag_editor_save(move || {
+            let Some(w) = weak.upgrade() else { return };
+            let editing_id = frag_editing_id.get();
+            w.set_frag_editor_open(false);
+
+            let start_ms = parse_mmss(&w.get_frag_editor_start_text());
+            let end_ms = parse_mmss(&w.get_frag_editor_end_text());
+            let (start_ms, end_ms) = match (start_ms, end_ms) {
+                (Some(s), Some(e)) => (s, e),
+                _ => {
+                    w.set_frag_error_text("Invalid time format. Use m:ss.".into());
+                    w.set_frag_error_open(true);
+                    return;
+                }
+            };
+            let invalid = end_ms <= start_ms
+                || frag_overlaps(&current_fragments.borrow(), start_ms, end_ms, editing_id);
+            if invalid {
+                w.set_frag_error_text("Invalid range: end is before start, or it overlaps another fragment.".into());
+                w.set_frag_error_open(true);
+                return;
+            }
+
+            let id = current.get();
+            let title = w.get_frag_editor_title_text().to_string();
+            let result = if editing_id < 0 {
+                ui_db.create_fragment(id, start_ms, end_ms, &title, now_unix())
+                    .map(|_| ())
+            } else {
+                ui_db.update_fragment(editing_id, start_ms, end_ms, &title)
+            };
+            if let Err(e) = result {
+                log::error!("Сохранение фрагмента: {e}");
+            }
+            rebuild_viewer_fragments(id);
+        });
+    }
+
+    {
+        let weak = window.as_weak();
+        window.on_frag_editor_cancel(move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_frag_editor_open(false);
+            }
+        });
+    }
+
+    {
+        let weak = window.as_weak();
+        window.on_frag_error_ok(move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_frag_error_open(false);
+            }
+        });
+    }
+
+    // ПКМ-меню сегмента: «Редактировать» — открыть оверлей с текущими значениями.
+    {
+        let weak = window.as_weak();
+        let frag_editing_id = frag_editing_id.clone();
+        let frag_marking_start = frag_marking_start.clone();
+        let current_fragments = current_fragments.clone();
+        window.on_frag_edit(move |id| {
+            let Some(w) = weak.upgrade() else { return };
+            let id = id as i64;
+            let Some(f) = current_fragments.borrow().iter().find(|f| f.id == id).map(|f| {
+                (f.start_ms, f.end_ms, f.title.clone())
+            }) else {
+                return;
+            };
+            // Открытие редактора отменяет незавершённую разметку кнопкой.
+            frag_marking_start.set(None);
+            w.set_frag_marking(false);
+
+            frag_editing_id.set(id);
+            w.set_frag_editor_heading("Edit fragment".into());
+            w.set_frag_editor_title_text(f.2.into());
+            w.set_frag_editor_start_text(fmt_mmss(f.0).into());
+            w.set_frag_editor_end_text(fmt_mmss(f.1).into());
+            w.set_frag_editor_open(true);
+        });
+    }
+
+    // ПКМ-меню сегмента: «Удалить» — подтверждение, затем удаление.
+    {
+        let weak = window.as_weak();
+        let frag_delete_target = frag_delete_target.clone();
+        window.on_frag_delete_request(move |id| {
+            frag_delete_target.set(id as i64);
+            if let Some(w) = weak.upgrade() {
+                w.set_frag_delete_confirm_open(true);
+            }
+        });
+    }
+
+    {
+        let weak = window.as_weak();
+        let ui_db = ui_db.clone();
+        let current = current_open_id.clone();
+        let frag_delete_target = frag_delete_target.clone();
+        let rebuild_viewer_fragments = rebuild_viewer_fragments.clone();
+        window.on_frag_delete_confirm_ok(move || {
+            if let Err(e) = ui_db.delete_fragment(frag_delete_target.get()) {
+                log::error!("Удаление фрагмента: {e}");
+            }
+            if let Some(w) = weak.upgrade() {
+                w.set_frag_delete_confirm_open(false);
+            }
+            rebuild_viewer_fragments(current.get());
+        });
+    }
+
+    {
+        let weak = window.as_weak();
+        window.on_frag_delete_confirm_cancel(move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_frag_delete_confirm_open(false);
+            }
+        });
+    }
+
     // Таймер плеера: тянем позицию/длительность/паузу из mpv в UI.
     let player_timer = slint::Timer::default();
     {
@@ -1643,6 +1888,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mpv = mpv_opt.clone();
         let fullscreen = fullscreen.clone();
         let last_activity = last_activity.clone();
+        let current_fragments = current_fragments.clone();
         player_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(250),
@@ -1662,6 +1908,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(paused) = mpv.get_flag("pause") {
                         w.set_viewer_paused(paused);
                     }
+                    // Кнопки разметки фрагмента недоступны, пока позиция плеера
+                    // внутри уже существующего фрагмента (нельзя начинать/
+                    // заканчивать новый прямо посреди чужого диапазона).
+                    let pos_ms = (pos * 1000.0) as i64;
+                    let inside = current_fragments
+                        .borrow()
+                        .iter()
+                        .any(|f| f.start_ms <= pos_ms && pos_ms < f.end_ms);
+                    w.set_frag_buttons_disabled(inside);
                 }
                 // Авто-скрытие контролов в полноэкранном режиме.
                 if fullscreen.get() {

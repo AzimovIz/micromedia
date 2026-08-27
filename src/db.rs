@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// Текущая версия схемы. Инкрементируем при добавлении миграции.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE files (
@@ -51,6 +51,22 @@ CREATE TABLE file_tags (
 );
 
 CREATE INDEX idx_file_tags_tag ON file_tags(tag_id);
+"#;
+
+const SCHEMA_V2: &str = r#"
+-- Фрагменты видео: именованный диапазон [start_ms, end_ms) внутри файла.
+-- Непересекающиеся — гарантируется на уровне Rust (см. main.rs) при
+-- создании/редактировании, а не констрейнтом схемы.
+CREATE TABLE fragments (
+    id         INTEGER PRIMARY KEY,
+    file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    start_ms   INTEGER NOT NULL,
+    end_ms     INTEGER NOT NULL,
+    title      TEXT    NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_fragments_file ON fragments(file_id);
 "#;
 
 /// Тип медиа. Хранится в БД целым числом.
@@ -116,6 +132,14 @@ pub enum Pending {
 pub struct Tag {
     pub id: i64,
     pub name: String,
+}
+
+/// Фрагмент видео — именованный диапазон [start_ms, end_ms).
+pub struct Fragment {
+    pub id: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub title: String,
 }
 
 /// Элемент галереи (для сетки и дерева).
@@ -225,7 +249,9 @@ impl Db {
         if current < 1 {
             self.conn.execute_batch(SCHEMA_V1)?;
         }
-        // будущие миграции: if current < 2 { ... }
+        if current < 2 {
+            self.conn.execute_batch(SCHEMA_V2)?;
+        }
 
         if current != SCHEMA_VERSION {
             self.conn.execute(
@@ -662,6 +688,61 @@ impl Db {
             })
         })?;
         rows.collect()
+    }
+
+    // --- Фрагменты ---
+
+    pub fn fragments_for_file(&self, file_id: i64) -> rusqlite::Result<Vec<Fragment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, start_ms, end_ms, title FROM fragments
+              WHERE file_id = ?1
+              ORDER BY start_ms ASC",
+        )?;
+        let rows = stmt.query_map([file_id], |r| {
+            Ok(Fragment {
+                id: r.get(0)?,
+                start_ms: r.get(1)?,
+                end_ms: r.get(2)?,
+                title: r.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn create_fragment(
+        &self,
+        file_id: i64,
+        start_ms: i64,
+        end_ms: i64,
+        title: &str,
+        now: i64,
+    ) -> rusqlite::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO fragments(file_id, start_ms, end_ms, title, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![file_id, start_ms, end_ms, title, now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_fragment(
+        &self,
+        id: i64,
+        start_ms: i64,
+        end_ms: i64,
+        title: &str,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE fragments SET start_ms = ?2, end_ms = ?3, title = ?4 WHERE id = ?1",
+            params![id, start_ms, end_ms, title],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_fragment(&self, id: i64) -> rusqlite::Result<()> {
+        self.conn
+            .execute("DELETE FROM fragments WHERE id = ?1", [id])?;
+        Ok(())
     }
 }
 

@@ -20,6 +20,13 @@ export struct TagItem {
     name: string,
 }
 
+export struct FragmentItem {
+    id: int,
+    start: float,   // сек, единицы совпадают с MediaSlider.value
+    end: float,     // сек
+    title: string,
+}
+
 export struct TileLayout {
     x: length,
     y: length,
@@ -77,6 +84,11 @@ component MediaSlider inherits Rectangle {
     // Живое изменение (клик в точку полосы или перетаскивание).
     callback changed(float);
 
+    // Фрагменты (только на полосе перемотки видео; у громкости пусто).
+    in property <[FragmentItem]> fragments: [];
+    callback frag-edit(int);
+    callback frag-delete-request(int);
+
     min-height: 18px;
     horizontal-stretch: 1;
     property <float> span: Math.max(0.0001, root.maximum - root.minimum);
@@ -123,6 +135,101 @@ component MediaSlider inherits Rectangle {
         moved => {
             if (self.pressed) {
                 root.seek-to(self.mouse-x);
+            }
+        }
+    }
+
+    // Подсветка фрагментов: полупрозрачно-жёлтые сегменты, нарисованные на
+    // том же уровне высоты, что и трек. Объявлены ПОСЛЕ sl-ta — в Slint более
+    // поздние по тексту элементы выше по z-order и первыми ловят события,
+    // поэтому клик/наведение внутри сегмента достаётся его TouchArea, а не
+    // sl-ta (тот у себя занимает всю ширину слайдера и иначе перехватил бы
+    // всё раньше, до сегментов).
+    for f in root.fragments: Rectangle {
+        y: (parent.height - self.height) / 2;
+        height: 4px;
+        x: parent.width * Math.clamp((f.start - root.minimum) / root.span, 0.0, 1.0);
+        width: parent.width * Math.clamp((f.end - root.minimum) / root.span, 0.0, 1.0) - self.x;
+        border-radius: 2px;
+        background: #ffd23c60;
+
+        if frag-ta.has-hover: Rectangle {
+            y: -24px;
+            x: (parent.width - self.width) / 2;
+            width: tip.preferred-width + 12px;
+            height: 20px;
+            border-radius: 4px;
+            background: #202028;
+            border-width: 1px;
+            border-color: #4a4a54;
+            tip := Text {
+                text: f.title;
+                color: #e6e6e6;
+                font-size: 11px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        frag-ta := TouchArea {
+            clicked => { root.value = f.start; root.changed(f.start); }
+            pointer-event(e) => {
+                if (e.button == PointerEventButton.right && e.kind == PointerEventKind.down) {
+                    frag-ctx.show();
+                }
+            }
+        }
+
+        frag-ctx := PopupWindow {
+            property <length> menu-w: 160px;
+            property <length> menu-h: 2 * 30px + 8px;
+            // Слайдер лежит у самого низа окна плеера — открытие вниз/вправо
+            // от курсора (как у остальных меню в приложении) обрезалось бы
+            // границей окна, поэтому здесь открываем вверх и клэмпим по x.
+            x: max(0px, min(frag-ta.mouse-x, root.width - parent.x - self.menu-w - 4px));
+            y: frag-ta.mouse-y - self.menu-h - 6px;
+            width: self.menu-w;
+            height: self.menu-h;
+            close-policy: close-on-click-outside;
+            Rectangle {
+                background: #2a2a32;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #4a4a54;
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+                    Rectangle {
+                        height: 28px;
+                        background: fcm1.has-hover ? #3a3a44 : transparent;
+                        border-radius: 4px;
+                        Text {
+                            x: 10px;
+                            text: "Edit";
+                            color: #dddddd;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        fcm1 := TouchArea {
+                            clicked => { root.frag-edit(f.id); frag-ctx.close(); }
+                        }
+                    }
+                    Rectangle {
+                        height: 28px;
+                        background: fcm2.has-hover ? #4a2a2a : transparent;
+                        border-radius: 4px;
+                        Text {
+                            x: 10px;
+                            text: "Delete";
+                            color: #ecc0c0;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        fcm2 := TouchArea {
+                            clicked => { root.frag-delete-request(f.id); frag-ctx.close(); }
+                        }
+                    }
+                }
             }
         }
     }
@@ -278,6 +385,35 @@ export component MainWindow inherits Window {
     callback viewer-set-thumbnail();
     // Внутренний: фоновая генерация миниатюры завершена (id файла)
     callback thumb-updated(int);
+
+    // --- Фрагменты открытого видео ---
+    in property <[FragmentItem]> viewer-fragments;
+    // true между кликами «Начало фрагмента» и «Конец фрагмента».
+    in property <bool> frag-marking: false;
+    // Позиция плеера сейчас внутри уже существующего фрагмента — кнопка неактивна.
+    in property <bool> frag-buttons-disabled: false;
+    callback frag-mark-clicked();
+    callback frag-edit(int);              // из меню сегмента — открыть редактор
+    callback frag-delete-request(int);    // из меню сегмента — запросить подтверждение
+
+    // Оверлей метаданных (создание нового / редактирование существующего).
+    in-out property <bool> frag-editor-open: false;
+    in property <string> frag-editor-heading: "New fragment";
+    in-out property <string> frag-editor-title-text;
+    in-out property <string> frag-editor-start-text;
+    in-out property <string> frag-editor-end-text;
+    callback frag-editor-save();
+    callback frag-editor-cancel();
+
+    // Оверлей ошибки валидации диапазона.
+    in-out property <bool> frag-error-open: false;
+    in property <string> frag-error-text;
+    callback frag-error-ok();
+
+    // Подтверждение удаления фрагмента.
+    in-out property <bool> frag-delete-confirm-open: false;
+    callback frag-delete-confirm-ok();
+    callback frag-delete-confirm-cancel();
 
     // Индекс подсвеченной подсказки для навигации ↑/↓ (−1 = ничего).
     property <int> add-suggest-idx: -1;
@@ -1700,6 +1836,29 @@ export component MainWindow inherits Window {
                 }
             }
 
+            // Разметка фрагмента: «Начало» → запоминает позицию, «Конец» → её же
+            // фиксирует и (если диапазон валиден) открывает форму метаданных.
+            if root.viewer-is-video: Rectangle {
+                x: parent.width - self.width - 8px - 50px - 156px - 8px;
+                y: 8px;
+                width: 170px;
+                height: 30px;
+                border-radius: 6px;
+                background: !root.frag-buttons-disabled && fragm-ta.has-hover ? #3a3a48 : #2a2a32;
+                opacity: root.frag-buttons-disabled ? 0.5 : 1.0;
+                Text {
+                    text: root.frag-marking ? "End fragment" : "Start fragment";
+                    color: #e6e6e6;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                fragm-ta := TouchArea {
+                    enabled: !root.frag-buttons-disabled;
+                    clicked => { root.frag-mark-clicked(); }
+                }
+            }
+
             // Справа: сделать текущий кадр видео миниатюрой файла.
             if root.viewer-is-video: Rectangle {
                 x: parent.width - self.width - 8px - 50px;
@@ -1795,6 +1954,9 @@ export component MainWindow inherits Window {
                     maximum: Math.max(1, root.viewer-duration);
                     value <=> root.viewer-pos;
                     changed(v) => { root.viewer-seek(v); }
+                    fragments: root.viewer-fragments;
+                    frag-edit(id) => { root.frag-edit(id); }
+                    frag-delete-request(id) => { root.frag-delete-request(id); }
                 }
 
                 // Скорость
@@ -1886,6 +2048,208 @@ export component MainWindow inherits Window {
                 return EventResult.reject;
             }
             init => { self.focus(); }
+        }
+
+        // --- Оверлей: метаданные фрагмента (создание/редактирование) ---
+        if root.frag-editor-open : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000aa;
+            TouchArea { clicked => { root.frag-editor-cancel(); } }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 340px;
+                height: 260px;
+                background: #23232b;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #4a4a54;
+                TouchArea { }
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+                    Text {
+                        text: root.frag-editor-heading;
+                        color: #e6e6e6;
+                        font-size: 15px;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: "Title";
+                        color: #9a9aa4;
+                        font-size: 11px;
+                    }
+                    LineEdit {
+                        text <=> root.frag-editor-title-text;
+                        placeholder-text: "Fragment title";
+                        // Плейсхолдер полупрозрачный: тускнеет всё поле, пока
+                        // оно пустое (реальный текст сверху даёт непрозрачность).
+                        opacity: root.frag-editor-title-text == "" ? 0.5 : 1.0;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text { text: "Start (m:ss)"; color: #9a9aa4; font-size: 11px; }
+                            LineEdit { text <=> root.frag-editor-start-text; }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text { text: "End (m:ss)"; color: #9a9aa4; font-size: 11px; }
+                            LineEdit { text <=> root.frag-editor-end-text; }
+                        }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle {
+                            height: 32px;
+                            background: fecancel.has-hover ? #3a3a44 : #303038;
+                            border-radius: 5px;
+                            Text {
+                                text: "Cancel";
+                                color: #dddddd;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            fecancel := TouchArea {
+                                clicked => { root.frag-editor-cancel(); }
+                            }
+                        }
+                        Rectangle {
+                            height: 32px;
+                            background: fesave.has-hover ? #5a9bc0 : #4a8bb0;
+                            border-radius: 5px;
+                            Text {
+                                text: "Save";
+                                color: white;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            fesave := TouchArea {
+                                clicked => { root.frag-editor-save(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Оверлей: ошибка валидации диапазона фрагмента ---
+        if root.frag-error-open : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000aa;
+            TouchArea { clicked => { root.frag-error-ok(); } }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 320px;
+                height: 130px;
+                background: #23232b;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #6a3a3a;
+                TouchArea { }
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 14px;
+                    Text {
+                        text: root.frag-error-text;
+                        color: #ecc0c0;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                        horizontal-alignment: center;
+                        vertical-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        height: 32px;
+                        background: feok.has-hover ? #3a3a44 : #303038;
+                        border-radius: 5px;
+                        Text {
+                            text: "OK";
+                            color: #dddddd;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        feok := TouchArea {
+                            clicked => { root.frag-error-ok(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Оверлей: подтверждение удаления фрагмента ---
+        if root.frag-delete-confirm-open : Rectangle {
+            width: 100%;
+            height: 100%;
+            background: #000000aa;
+            TouchArea { clicked => { root.frag-delete-confirm-cancel(); } }
+
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 300px;
+                height: 120px;
+                background: #23232b;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #6a3a3a;
+                TouchArea { }
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 14px;
+                    Text {
+                        text: "Delete fragment?";
+                        color: #ecc0c0;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Rectangle {
+                            height: 32px;
+                            background: fdcancel.has-hover ? #3a3a44 : #303038;
+                            border-radius: 5px;
+                            Text {
+                                text: "Cancel";
+                                color: #dddddd;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            fdcancel := TouchArea {
+                                clicked => { root.frag-delete-confirm-cancel(); }
+                            }
+                        }
+                        Rectangle {
+                            height: 32px;
+                            background: fdok.has-hover ? #c0392b : #a03028;
+                            border-radius: 5px;
+                            Text {
+                                text: "Delete";
+                                color: white;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            fdok := TouchArea {
+                                clicked => { root.frag-delete-confirm-ok(); }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

@@ -54,6 +54,9 @@ Portable desktop viewer for video and images.
 - Fullscreen mode with auto-hiding controls (appear on mouse movement).
 - RAM demux cache — smooth playback even from a slow flash drive.
 - **Set as thumbnail** — make the current frame the file's thumbnail.
+- **Fragments** — mark a start/end range on the timeline and name it; it's
+  highlighted on the seek bar (hover for the name), click to jump to its
+  start, right-click to edit or delete.
 - Keys: `Space` — pause, `←/→` — ±5 s, `F` — fullscreen, `Esc` — exit.
 
 ### Organization and search
