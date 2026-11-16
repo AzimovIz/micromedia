@@ -235,6 +235,1021 @@ component MediaSlider inherits Rectangle {
     }
 }
 
+// Просмотрщик (фото/видео): одна и та же вёрстка во встроенном режиме
+// (поверх галереи в MainWindow) и в отдельном окне (PlayerWindow, «детач»).
+// Состояние приходит прослойками свойств из окна-владельца — Rust работает
+// с одинаковыми именами свойств у обоих окон (см. src/viewer.rs).
+component Viewer inherits Rectangle {
+    // true — плеер живёт в отдельном окне (кнопка «детач» скрыта).
+    in property <bool> detached: false;
+    callback viewer-detach();
+
+    // --- Состояние (выставляет Rust) ---
+    in property <bool> viewer-is-video: false;
+    in property <image> viewer-image;
+    in property <string> viewer-name;
+    in property <bool> viewer-paused: false;
+    in-out property <float> viewer-pos: 0;
+    in property <float> viewer-duration: 0;
+    callback viewer-close();
+    callback viewer-toggle-play();
+    callback viewer-seek(float);
+
+    in-out property <float> viewer-volume: 100;
+    in property <bool> viewer-muted: false;
+    in property <float> viewer-speed: 1.0;
+    in property <bool> viewer-loop: false;
+    in property <bool> viewer-fullscreen: false;
+    in property <string> viewer-time-text;
+    in property <bool> viewer-controls-visible: true;
+    callback viewer-skip(float);
+    callback viewer-frame-step(int);
+    callback viewer-set-volume(float);
+    callback viewer-toggle-mute();
+    callback viewer-cycle-speed();
+    callback viewer-toggle-loop();
+    callback viewer-toggle-fullscreen();
+    callback viewer-activity();
+
+    in-out property <float> viewer-zoom: 1.0;
+    in-out property <float> viewer-pan-x: 0;
+    in-out property <float> viewer-pan-y: 0;
+    callback viewer-transform-changed();
+
+    in property <[TagItem]> viewer-tags;
+    in-out property <string> add-tag-text;
+    in property <[string]> add-tag-suggestions;
+    callback toggle-file-tag(int);
+    callback add-tag-edited(string);
+    callback add-tag-commit(string);
+    callback pick-add-suggestion(string);
+    callback viewer-set-thumbnail();
+
+    in property <[FragmentItem]> viewer-fragments;
+    in property <bool> frag-marking: false;
+    in property <bool> frag-buttons-disabled: false;
+    callback frag-mark-clicked();
+    callback frag-edit(int);
+    callback frag-delete-request(int);
+
+    in-out property <bool> frag-editor-open: false;
+    in property <string> frag-editor-heading: "New fragment";
+    in-out property <string> frag-editor-title-text;
+    in-out property <string> frag-editor-start-text;
+    in-out property <string> frag-editor-end-text;
+    callback frag-editor-save();
+    callback frag-editor-cancel();
+
+    in-out property <bool> frag-error-open: false;
+    in property <string> frag-error-text;
+    callback frag-error-ok();
+
+    in-out property <bool> frag-delete-confirm-open: false;
+    callback frag-delete-confirm-ok();
+    callback frag-delete-confirm-cancel();
+
+    // ПКМ-меню чипа тега: действия над строкой фильтра галереи.
+    callback filter-add-include(string);
+    callback filter-add-exclude(string);
+    callback filter-remove(string);
+
+    // Индекс подсвеченной подсказки для навигации ↑/↓ (−1 = ничего).
+    property <int> add-suggest-idx: -1;
+    // Ширина кнопок справа в верхней панели: ✕ (+ «детач» во встроенном режиме).
+    property <length> top-right-w: root.detached ? 50px : 100px;
+
+    width: 100%;
+    height: 100%;
+    background: root.viewer-is-video ? transparent : #0b0b0d;
+
+    // Зумируемое изображение (в клип-контейнере)
+    if !root.viewer-is-video: Rectangle {
+        width: 100%;
+        height: 100%;
+        clip: true;
+        Image {
+            width: parent.width * root.viewer-zoom;
+            height: parent.height * root.viewer-zoom;
+            x: (parent.width - self.width) / 2 + root.viewer-pan-x * parent.width;
+            y: (parent.height - self.height) / 2 + root.viewer-pan-y * parent.height;
+            image-fit: contain;
+            source: root.viewer-image;
+        }
+    }
+
+    // Единый инпут: колесо — зум, ЛКМ-перетаскивание — панорама (при зуме),
+    // одиночный ЛКМ по видео — пауза, СКМ — сброс зума. Под контролами по
+    // z-order (объявлен раньше нижней/верхней панелей).
+    zoom-ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        property <bool> dragging: false;
+        property <float> px-start;
+        property <float> py-start;
+        property <float> nz; // новый зум (временное, для zoom-at)
+
+        // Любое движение мыши (даже без нажатия) — показать контролы.
+        // `moved` в Slint срабатывает только при зажатой кнопке, поэтому
+        // ловим изменение позиции курсора напрямую.
+        changed mouse-x => { root.viewer-activity(); }
+        changed mouse-y => { root.viewer-activity(); }
+
+        // Зум к точке под курсором: удерживаем точку картинки под курсором
+        // на месте, пересчитывая пан. sx/sy — доля вьюпорта под курсором;
+        // root.viewer-zoom здесь ещё СТАРЫЙ, self.nz — новый. Картинка —
+        // «бокс» W·zoom, центрированный и сдвинутый на pan·W; выводим pan'
+        // из условия «доля бокса под курсором не меняется».
+        function zoom-at(sx: float, sy: float) {
+            root.viewer-pan-x = sx
+                - self.nz * (sx - (1 - root.viewer-zoom) / 2 - root.viewer-pan-x) / root.viewer-zoom
+                - (1 - self.nz) / 2;
+            root.viewer-pan-y = sy
+                - self.nz * (sy - (1 - root.viewer-zoom) / 2 - root.viewer-pan-y) / root.viewer-zoom
+                - (1 - self.nz) / 2;
+            root.viewer-zoom = self.nz;
+        }
+
+        scroll-event(e) => {
+            self.nz = Math.clamp(
+                root.viewer-zoom * (e.delta-y > 0 ? 1.1 : 0.9), 1.0, 8.0);
+            if (self.nz <= 1.0) {
+                root.viewer-zoom = 1.0;
+                root.viewer-pan-x = 0;
+                root.viewer-pan-y = 0;
+            } else {
+                self.zoom-at(self.mouse-x / self.width, self.mouse-y / self.height);
+            }
+            root.viewer-transform-changed();
+            root.viewer-activity();
+            return accept;
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                if (e.button == PointerEventButton.middle) {
+                    root.viewer-zoom = 1.0;
+                    root.viewer-pan-x = 0;
+                    root.viewer-pan-y = 0;
+                    root.viewer-transform-changed();
+                } else if (e.button == PointerEventButton.left) {
+                    self.dragging = false;
+                    self.px-start = root.viewer-pan-x;
+                    self.py-start = root.viewer-pan-y;
+                }
+                root.viewer-activity();
+            }
+            if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                if (!self.dragging && root.viewer-is-video) {
+                    root.viewer-toggle-play();
+                }
+                key-fs.focus();
+            }
+        }
+        // Двойной клик по видео — на весь экран (как кнопка ⛶).
+        double-clicked => {
+            if (root.viewer-is-video) {
+                root.viewer-toggle-fullscreen();
+            }
+        }
+        // Порог клик/перетаскивание и панораму считаем от pressed-x/pressed-y,
+        // которые Slint выставляет по реальной точке нажатия (иначе первое
+        // событие после ползунка ловит устаревший mouse-x).
+        moved => {
+            if (self.pressed) {
+                if (Math.abs(self.mouse-x - self.pressed-x) > 3px
+                        || Math.abs(self.mouse-y - self.pressed-y) > 3px) {
+                    self.dragging = true;
+                }
+                if (root.viewer-zoom > 1.0) {
+                    root.viewer-pan-x = self.px-start + (self.mouse-x - self.pressed-x) / self.width;
+                    root.viewer-pan-y = self.py-start + (self.mouse-y - self.pressed-y) / self.height;
+                    root.viewer-transform-changed();
+                }
+            }
+            root.viewer-activity();
+        }
+    }
+
+    // Полоса тегов файла: назначенные чипы + поле добавления
+    Rectangle {
+        y: 0;
+        height: 46px;
+        width: 100%;
+        background: #000000bb;
+        visible: root.viewer-controls-visible;
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            padding-top: 8px;
+            padding-bottom: 8px;
+            spacing: 6px;
+            alignment: start;
+
+            for t in root.viewer-tags: Rectangle {
+                background: #2e7d32;
+                border-radius: 8px;
+
+                // Поглощает клики по чипу (не проваливаются на видео);
+                // ПКМ — контекстное меню действий над фильтром.
+                chip-bg := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => { }
+                    pointer-event(event) => {
+                        if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                            menu-popup.show();
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 6px;
+                    spacing: 6px;
+                    Text {
+                        text: t.name;
+                        color: white;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                    // Крестик — удаление только по нему (с подтверждением)
+                    Rectangle {
+                        width: 18px;
+                        Text {
+                            text: "✕";
+                            color: xta.has-hover ? #ffd0d0 : #ffffffbb;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        xta := TouchArea {
+                            clicked => { confirm-popup.show(); }
+                        }
+                    }
+                }
+
+                // Подтверждение под тегом; клик вне окна = отмена.
+                confirm-popup := PopupWindow {
+                    x: 0px;
+                    y: parent.height + 3px;
+                    width: 148px;
+                    height: 62px;
+                    close-policy: close-on-click-outside;
+                    Rectangle {
+                        background: #2a2a32;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #4a4a54;
+                        VerticalLayout {
+                            padding: 8px;
+                            spacing: 6px;
+                            Text {
+                                text: "Удалить тег?";
+                                color: #e6e6e6;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Rectangle {
+                                    height: 24px;
+                                    background: cta.has-hover ? #3a3a44 : #303038;
+                                    border-radius: 4px;
+                                    Text {
+                                        text: "Cancel";
+                                        color: #dddddd;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    cta := TouchArea {
+                                        clicked => { confirm-popup.close(); }
+                                    }
+                                }
+                                Rectangle {
+                                    height: 24px;
+                                    background: ota.has-hover ? #c0392b : #a03028;
+                                    border-radius: 4px;
+                                    Text {
+                                        text: "Ok";
+                                        color: white;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    ota := TouchArea {
+                                        clicked => {
+                                            root.toggle-file-tag(t.id);
+                                            confirm-popup.close();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ПКМ-меню: действия над строкой фильтра
+                menu-popup := PopupWindow {
+                    x: 0px;
+                    y: parent.height + 3px;
+                    width: 190px;
+                    height: 96px;
+                    close-policy: close-on-click-outside;
+                    Rectangle {
+                        background: #2a2a32;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #4a4a54;
+                        VerticalLayout {
+                            padding: 4px;
+                            spacing: 2px;
+                            Rectangle {
+                                height: 28px;
+                                background: mi1.has-hover ? #3a3a44 : transparent;
+                                border-radius: 4px;
+                                Text {
+                                    x: 10px;
+                                    text: "Добавить в фильтр";
+                                    color: #dddddd;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                                mi1 := TouchArea {
+                                    clicked => { root.filter-add-include(t.name); menu-popup.close(); }
+                                }
+                            }
+                            Rectangle {
+                                height: 28px;
+                                background: mi2.has-hover ? #3a3a44 : transparent;
+                                border-radius: 4px;
+                                Text {
+                                    x: 10px;
+                                    text: "Добавить в исключение";
+                                    color: #dddddd;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                                mi2 := TouchArea {
+                                    clicked => { root.filter-add-exclude(t.name); menu-popup.close(); }
+                                }
+                            }
+                            Rectangle {
+                                height: 28px;
+                                background: mi3.has-hover ? #3a3a44 : transparent;
+                                border-radius: 4px;
+                                Text {
+                                    x: 10px;
+                                    text: "Убрать из поиска";
+                                    color: #dddddd;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                                mi3 := TouchArea {
+                                    clicked => { root.filter-remove(t.name); menu-popup.close(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            add-edit := LineEdit {
+                width: 160px;
+                placeholder-text: "+ тег";
+                // приглушаем поле над картинкой, пока оно пустое
+                opacity: root.add-tag-text == "" ? 0.5 : 1.0;
+                text <=> root.add-tag-text;
+                edited(t) => { root.add-suggest-idx = -1; root.add-tag-edited(t); }
+                accepted(t) => { root.add-suggest-idx = -1; root.add-tag-commit(t); }
+                // ↑/↓ — выбрать подсказку и подставить её текст в поле.
+                key-pressed(event) => {
+                    if (root.add-tag-suggestions.length > 0 && event.text == Key.DownArrow) {
+                        root.add-suggest-idx = root.add-suggest-idx + 1 >= root.add-tag-suggestions.length
+                            ? 0 : root.add-suggest-idx + 1;
+                        root.add-tag-text = root.add-tag-suggestions[root.add-suggest-idx];
+                        return EventResult.accept;
+                    }
+                    if (root.add-tag-suggestions.length > 0 && event.text == Key.UpArrow) {
+                        root.add-suggest-idx = root.add-suggest-idx <= 0
+                            ? root.add-tag-suggestions.length - 1 : root.add-suggest-idx - 1;
+                        root.add-tag-text = root.add-tag-suggestions[root.add-suggest-idx];
+                        return EventResult.accept;
+                    }
+                    return EventResult.reject;
+                }
+            }
+        }
+
+        // Выпадающие подсказки под полем (у левого края полосы)
+        if root.add-tag-suggestions.length > 0: Rectangle {
+            x: 8px;
+            y: 46px;
+            width: 200px;
+            height: Math.min(root.add-tag-suggestions.length, 6) * 26px;
+            background: #202028;
+            border-radius: 4px;
+            VerticalLayout {
+                for s[i] in root.add-tag-suggestions: Rectangle {
+                    height: 26px;
+                    background: (i == root.add-suggest-idx || asug-ta.has-hover) ? #2f2f3a : transparent;
+                    Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        text: s;
+                        color: #dddddd;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    asug-ta := TouchArea {
+                        // Пока поле ввода в фокусе, первый клик по подсказке
+                        // тратится на перенос фокуса обратно в key-fs (в модалке
+                        // FocusScope нет — там проблемы нет). Уводим фокус заранее,
+                        // при наведении, чтобы сам клик уже ничего не переносил.
+                        changed has-hover => {
+                            if (self.has-hover) { key-fs.focus(); }
+                        }
+                        clicked => { root.pick-add-suggestion(s); }
+                    }
+                }
+            }
+        }
+
+        // Разметка фрагмента: «Начало» → запоминает позицию, «Конец» → её же
+        // фиксирует и (если диапазон валиден) открывает форму метаданных.
+        if root.viewer-is-video: Rectangle {
+            x: parent.width - self.width - 8px - root.top-right-w - 156px - 8px;
+            y: 8px;
+            width: 170px;
+            height: 30px;
+            border-radius: 6px;
+            background: !root.frag-buttons-disabled && fragm-ta.has-hover ? #3a3a48 : #2a2a32;
+            opacity: root.frag-buttons-disabled ? 0.5 : 1.0;
+            Text {
+                text: root.frag-marking ? "End fragment" : "Start fragment";
+                color: #e6e6e6;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            fragm-ta := TouchArea {
+                enabled: !root.frag-buttons-disabled;
+                clicked => { root.frag-mark-clicked(); }
+            }
+        }
+
+        // Справа: сделать текущий кадр видео миниатюрой файла.
+        if root.viewer-is-video: Rectangle {
+            x: parent.width - self.width - 8px - root.top-right-w;
+            y: 8px;
+            width: 156px;
+            height: 30px;
+            border-radius: 6px;
+            background: sett-ta.has-hover ? #3a3a48 : #2a2a32;
+            Text {
+                text: "Set as thumbnail";
+                color: #e6e6e6;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            sett-ta := TouchArea {
+                clicked => { root.viewer-set-thumbnail(); }
+            }
+        }
+
+        CtrlBtn {
+            x: parent.width - self.width - 8px;
+            y: 8px;
+            label: "✕";
+            height: 30px;
+            fsize: 16px;
+            w: 44px;
+            clicked => { root.viewer-close(); }
+        }
+
+        // «Детач»: открыть файл в отдельном окне (сам плеер здесь закрывается).
+        if !root.detached: CtrlBtn {
+            x: parent.width - self.width - 8px - 50px;
+            y: 8px;
+            label: "⇗";
+            height: 30px;
+            fsize: 16px;
+            w: 44px;
+            clicked => { root.viewer-detach(); }
+        }
+    }
+
+    // Нижняя панель управления
+    Rectangle {
+        y: parent.height - 56px;
+        height: 56px;
+        width: 100%;
+        background: #000000cc;
+        visible: root.viewer-controls-visible;
+
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            spacing: 4px;
+
+            // --- Видео: полный набор контролов ---
+            if root.viewer-is-video: CtrlBtn {
+                label: "⏪";
+                fsize: 15px;
+                clicked => { root.viewer-skip(-10); }
+            }
+            if root.viewer-is-video: CtrlBtn {
+                label: "◀5";
+                fsize: 13px;
+                clicked => { root.viewer-skip(-5); }
+            }
+            if root.viewer-is-video: CtrlBtn {
+                label: "⏮";
+                fsize: 15px;
+                clicked => { root.viewer-frame-step(-1); }
+            }
+            if root.viewer-is-video: CtrlBtn {
+                label: root.viewer-paused ? "▶" : "⏸";
+                fsize: 18px;
+                w: 44px;
+                clicked => { root.viewer-toggle-play(); }
+            }
+            if root.viewer-is-video: CtrlBtn {
+                label: "⏭";
+                fsize: 15px;
+                clicked => { root.viewer-frame-step(1); }
+            }
+            if root.viewer-is-video: CtrlBtn {
+                label: "5▶";
+                fsize: 13px;
+                clicked => { root.viewer-skip(5); }
+            }
+            if root.viewer-is-video: CtrlBtn {
+                label: "⏩";
+                fsize: 15px;
+                clicked => { root.viewer-skip(10); }
+            }
+
+            if root.viewer-is-video: Text {
+                text: root.viewer-time-text;
+                color: #dddddd;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+
+            if root.viewer-is-video: MediaSlider {
+                horizontal-stretch: 1;
+                minimum: 0;
+                maximum: Math.max(1, root.viewer-duration);
+                value <=> root.viewer-pos;
+                changed(v) => { root.viewer-seek(v); }
+                fragments: root.viewer-fragments;
+                frag-edit(id) => { root.frag-edit(id); }
+                frag-delete-request(id) => { root.frag-delete-request(id); }
+            }
+
+            // Скорость
+            if root.viewer-is-video: CtrlBtn {
+                label: root.viewer-speed + "x";
+                fsize: 12px;
+                w: 46px;
+                clicked => { root.viewer-cycle-speed(); }
+            }
+            // Луп
+            if root.viewer-is-video: CtrlBtn {
+                label: "🔁";
+                fsize: 15px;
+                active: root.viewer-loop;
+                clicked => { root.viewer-toggle-loop(); }
+            }
+            // Mute
+            if root.viewer-is-video: CtrlBtn {
+                label: root.viewer-muted ? "🔇" : "🔊";
+                fsize: 14px;
+                clicked => { root.viewer-toggle-mute(); }
+            }
+            // Громкость (колесо над ползунком тоже меняет громкость: слайдер
+            // не ловит scroll, поэтому событие всплывает к этой TouchArea).
+            if root.viewer-is-video: TouchArea {
+                width: 84px;
+                scroll-event(e) => {
+                    root.viewer-volume = Math.clamp(
+                        root.viewer-volume + (e.delta-y > 0 ? 5 : -5), 0, 100);
+                    root.viewer-set-volume(root.viewer-volume);
+                    return accept;
+                }
+                MediaSlider {
+                    width: 100%;
+                    height: 100%;
+                    minimum: 0;
+                    maximum: 100;
+                    value <=> root.viewer-volume;
+                    changed(v) => { root.viewer-set-volume(v); }
+                }
+            }
+
+            // --- Изображение: имя файла ---
+            if !root.viewer-is-video: Text {
+                horizontal-stretch: 1;
+                text: root.viewer-name;
+                color: #dddddd;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+
+            // Полноэкранный + закрыть (общие)
+            CtrlBtn {
+                label: root.viewer-fullscreen ? "🗗" : "⛶";
+                fsize: 15px;
+                clicked => { root.viewer-toggle-fullscreen(); }
+            }
+        }
+    }
+
+    // Клавиатура: Esc — закрыть, пробел — play/pause, стрелки — перемотка,
+    // f — полный экран (для видео).
+    key-fs := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                if (root.viewer-fullscreen) {
+                    root.viewer-toggle-fullscreen();
+                } else {
+                    root.viewer-close();
+                }
+                return EventResult.accept;
+            }
+            if (event.text == " " && root.viewer-is-video) {
+                root.viewer-toggle-play();
+                return EventResult.accept;
+            }
+            if (event.text == Key.LeftArrow && root.viewer-is-video) {
+                root.viewer-skip(-5);
+                return EventResult.accept;
+            }
+            if (event.text == Key.RightArrow && root.viewer-is-video) {
+                root.viewer-skip(5);
+                return EventResult.accept;
+            }
+            if (event.text == "f" && root.viewer-is-video) {
+                root.viewer-toggle-fullscreen();
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+        init => { self.focus(); }
+    }
+
+    // --- Оверлей: метаданные фрагмента (создание/редактирование) ---
+    if root.frag-editor-open : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+        TouchArea { clicked => { root.frag-editor-cancel(); } }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 340px;
+            height: 260px;
+            background: #23232b;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #4a4a54;
+            TouchArea { }
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                Text {
+                    text: root.frag-editor-heading;
+                    color: #e6e6e6;
+                    font-size: 15px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Title";
+                    color: #9a9aa4;
+                    font-size: 11px;
+                }
+                LineEdit {
+                    text <=> root.frag-editor-title-text;
+                    placeholder-text: "Fragment title";
+                    // Плейсхолдер полупрозрачный: тускнеет всё поле, пока
+                    // оно пустое (реальный текст сверху даёт непрозрачность).
+                    opacity: root.frag-editor-title-text == "" ? 0.5 : 1.0;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text { text: "Start (m:ss)"; color: #9a9aa4; font-size: 11px; }
+                        LineEdit { text <=> root.frag-editor-start-text; }
+                    }
+                    VerticalLayout {
+                        spacing: 4px;
+                        Text { text: "End (m:ss)"; color: #9a9aa4; font-size: 11px; }
+                        LineEdit { text <=> root.frag-editor-end-text; }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        height: 32px;
+                        background: fecancel.has-hover ? #3a3a44 : #303038;
+                        border-radius: 5px;
+                        Text {
+                            text: "Cancel";
+                            color: #dddddd;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        fecancel := TouchArea {
+                            clicked => { root.frag-editor-cancel(); }
+                        }
+                    }
+                    Rectangle {
+                        height: 32px;
+                        background: fesave.has-hover ? #5a9bc0 : #4a8bb0;
+                        border-radius: 5px;
+                        Text {
+                            text: "Save";
+                            color: white;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        fesave := TouchArea {
+                            clicked => { root.frag-editor-save(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Оверлей: ошибка валидации диапазона фрагмента ---
+    if root.frag-error-open : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+        TouchArea { clicked => { root.frag-error-ok(); } }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 320px;
+            height: 130px;
+            background: #23232b;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #6a3a3a;
+            TouchArea { }
+            VerticalLayout {
+                padding: 16px;
+                spacing: 14px;
+                Text {
+                    text: root.frag-error-text;
+                    color: #ecc0c0;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    vertical-stretch: 1;
+                    vertical-alignment: center;
+                }
+                Rectangle {
+                    height: 32px;
+                    background: feok.has-hover ? #3a3a44 : #303038;
+                    border-radius: 5px;
+                    Text {
+                        text: "OK";
+                        color: #dddddd;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    feok := TouchArea {
+                        clicked => { root.frag-error-ok(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Оверлей: подтверждение удаления фрагмента ---
+    if root.frag-delete-confirm-open : Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000aa;
+        TouchArea { clicked => { root.frag-delete-confirm-cancel(); } }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 300px;
+            height: 120px;
+            background: #23232b;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #6a3a3a;
+            TouchArea { }
+            VerticalLayout {
+                padding: 16px;
+                spacing: 14px;
+                Text {
+                    text: "Delete fragment?";
+                    color: #ecc0c0;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    vertical-stretch: 1;
+                    vertical-alignment: center;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        height: 32px;
+                        background: fdcancel.has-hover ? #3a3a44 : #303038;
+                        border-radius: 5px;
+                        Text {
+                            text: "Cancel";
+                            color: #dddddd;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        fdcancel := TouchArea {
+                            clicked => { root.frag-delete-confirm-cancel(); }
+                        }
+                    }
+                    Rectangle {
+                        height: 32px;
+                        background: fdok.has-hover ? #c0392b : #a03028;
+                        border-radius: 5px;
+                        Text {
+                            text: "Delete";
+                            color: white;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        fdok := TouchArea {
+                            clicked => { root.frag-delete-confirm-ok(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Отдельное окно плеера («детач»): свой экземпляр mpv, свой render-контекст.
+// Окон может быть сколько угодно — каждое играет независимо.
+export component PlayerWindow inherits Window {
+    preferred-width: 960px;
+    preferred-height: 600px;
+    title: root.viewer-name == "" ? "MicroMedia" : root.viewer-name + " — MicroMedia";
+    // Прозрачный фон: видео рисует mpv подложкой (как в MainWindow).
+    background: transparent;
+
+    // Совместимость с MainWindow по именам (Rust-код плеера общий); не используется.
+    in property <bool> viewer-open: true;
+    callback viewer-detach();
+
+    // --- Состояние (выставляет Rust) ---
+    in property <bool> viewer-is-video: false;
+    in property <image> viewer-image;
+    in property <string> viewer-name;
+    in property <bool> viewer-paused: false;
+    in-out property <float> viewer-pos: 0;
+    in property <float> viewer-duration: 0;
+    callback viewer-close();
+    callback viewer-toggle-play();
+    callback viewer-seek(float);
+
+    in-out property <float> viewer-volume: 100;
+    in property <bool> viewer-muted: false;
+    in property <float> viewer-speed: 1.0;
+    in property <bool> viewer-loop: false;
+    in property <bool> viewer-fullscreen: false;
+    in property <string> viewer-time-text;
+    in property <bool> viewer-controls-visible: true;
+    callback viewer-skip(float);
+    callback viewer-frame-step(int);
+    callback viewer-set-volume(float);
+    callback viewer-toggle-mute();
+    callback viewer-cycle-speed();
+    callback viewer-toggle-loop();
+    callback viewer-toggle-fullscreen();
+    callback viewer-activity();
+
+    in-out property <float> viewer-zoom: 1.0;
+    in-out property <float> viewer-pan-x: 0;
+    in-out property <float> viewer-pan-y: 0;
+    callback viewer-transform-changed();
+
+    in property <[TagItem]> viewer-tags;
+    in-out property <string> add-tag-text;
+    in property <[string]> add-tag-suggestions;
+    callback toggle-file-tag(int);
+    callback add-tag-edited(string);
+    callback add-tag-commit(string);
+    callback pick-add-suggestion(string);
+    callback viewer-set-thumbnail();
+
+    in property <[FragmentItem]> viewer-fragments;
+    in property <bool> frag-marking: false;
+    in property <bool> frag-buttons-disabled: false;
+    callback frag-mark-clicked();
+    callback frag-edit(int);
+    callback frag-delete-request(int);
+
+    in-out property <bool> frag-editor-open: false;
+    in property <string> frag-editor-heading: "New fragment";
+    in-out property <string> frag-editor-title-text;
+    in-out property <string> frag-editor-start-text;
+    in-out property <string> frag-editor-end-text;
+    callback frag-editor-save();
+    callback frag-editor-cancel();
+
+    in-out property <bool> frag-error-open: false;
+    in property <string> frag-error-text;
+    callback frag-error-ok();
+
+    in-out property <bool> frag-delete-confirm-open: false;
+    callback frag-delete-confirm-ok();
+    callback frag-delete-confirm-cancel();
+
+    // ПКМ-меню чипа тега: действия над строкой фильтра галереи.
+    callback filter-add-include(string);
+    callback filter-add-exclude(string);
+    callback filter-remove(string);
+
+    Viewer {
+        width: 100%;
+        height: 100%;
+        detached: true;
+        viewer-is-video: root.viewer-is-video;
+        viewer-image: root.viewer-image;
+        viewer-name: root.viewer-name;
+        viewer-paused: root.viewer-paused;
+        viewer-pos <=> root.viewer-pos;
+        viewer-duration: root.viewer-duration;
+        viewer-volume <=> root.viewer-volume;
+        viewer-muted: root.viewer-muted;
+        viewer-speed: root.viewer-speed;
+        viewer-loop: root.viewer-loop;
+        viewer-fullscreen: root.viewer-fullscreen;
+        viewer-time-text: root.viewer-time-text;
+        viewer-controls-visible: root.viewer-controls-visible;
+        viewer-zoom <=> root.viewer-zoom;
+        viewer-pan-x <=> root.viewer-pan-x;
+        viewer-pan-y <=> root.viewer-pan-y;
+        viewer-tags: root.viewer-tags;
+        add-tag-text <=> root.add-tag-text;
+        add-tag-suggestions: root.add-tag-suggestions;
+        viewer-fragments: root.viewer-fragments;
+        frag-marking: root.frag-marking;
+        frag-buttons-disabled: root.frag-buttons-disabled;
+        frag-editor-open <=> root.frag-editor-open;
+        frag-editor-heading: root.frag-editor-heading;
+        frag-editor-title-text <=> root.frag-editor-title-text;
+        frag-editor-start-text <=> root.frag-editor-start-text;
+        frag-editor-end-text <=> root.frag-editor-end-text;
+        frag-error-open <=> root.frag-error-open;
+        frag-error-text: root.frag-error-text;
+        frag-delete-confirm-open <=> root.frag-delete-confirm-open;
+        viewer-close() => { root.viewer-close(); }
+        viewer-toggle-play() => { root.viewer-toggle-play(); }
+        viewer-seek(a0) => { root.viewer-seek(a0); }
+        viewer-skip(a0) => { root.viewer-skip(a0); }
+        viewer-frame-step(a0) => { root.viewer-frame-step(a0); }
+        viewer-set-volume(a0) => { root.viewer-set-volume(a0); }
+        viewer-toggle-mute() => { root.viewer-toggle-mute(); }
+        viewer-cycle-speed() => { root.viewer-cycle-speed(); }
+        viewer-toggle-loop() => { root.viewer-toggle-loop(); }
+        viewer-toggle-fullscreen() => { root.viewer-toggle-fullscreen(); }
+        viewer-activity() => { root.viewer-activity(); }
+        viewer-transform-changed() => { root.viewer-transform-changed(); }
+        toggle-file-tag(a0) => { root.toggle-file-tag(a0); }
+        add-tag-edited(a0) => { root.add-tag-edited(a0); }
+        add-tag-commit(a0) => { root.add-tag-commit(a0); }
+        pick-add-suggestion(a0) => { root.pick-add-suggestion(a0); }
+        viewer-set-thumbnail() => { root.viewer-set-thumbnail(); }
+        frag-mark-clicked() => { root.frag-mark-clicked(); }
+        frag-edit(a0) => { root.frag-edit(a0); }
+        frag-delete-request(a0) => { root.frag-delete-request(a0); }
+        frag-editor-save() => { root.frag-editor-save(); }
+        frag-editor-cancel() => { root.frag-editor-cancel(); }
+        frag-error-ok() => { root.frag-error-ok(); }
+        frag-delete-confirm-ok() => { root.frag-delete-confirm-ok(); }
+        frag-delete-confirm-cancel() => { root.frag-delete-confirm-cancel(); }
+        filter-add-include(a0) => { root.filter-add-include(a0); }
+        filter-add-exclude(a0) => { root.filter-add-exclude(a0); }
+        filter-remove(a0) => { root.filter-remove(a0); }
+    }
+}
+
 export component MainWindow inherits Window {
     preferred-width: 1280px;
     preferred-height: 800px;
@@ -347,6 +1362,8 @@ export component MainWindow inherits Window {
     in property <float> viewer-duration: 0;
 
     callback viewer-close();
+    // «Детач»: открыть текущий файл в отдельном окне плеера.
+    callback viewer-detach();
     callback viewer-toggle-play();
     callback viewer-seek(float);
 
@@ -416,7 +1433,6 @@ export component MainWindow inherits Window {
     callback frag-delete-confirm-cancel();
 
     // Индекс подсвеченной подсказки для навигации ↑/↓ (−1 = ничего).
-    property <int> add-suggest-idx: -1;
     property <int> tag-editor-suggest-idx: -1;
     property <int> bulk-suggest-idx: -1;
     property <int> filter-suggest-idx: -1;
@@ -1478,778 +2494,67 @@ export component MainWindow inherits Window {
     }
 
     // --- Слой просмотрщика ---
-    if root.viewer-open: Rectangle {
+    if root.viewer-open: Viewer {
         width: 100%;
         height: 100%;
-        background: root.viewer-is-video ? transparent : #0b0b0d;
-
-        // Зумируемое изображение (в клип-контейнере)
-        if !root.viewer-is-video: Rectangle {
-            width: 100%;
-            height: 100%;
-            clip: true;
-            Image {
-                width: parent.width * root.viewer-zoom;
-                height: parent.height * root.viewer-zoom;
-                x: (parent.width - self.width) / 2 + root.viewer-pan-x * parent.width;
-                y: (parent.height - self.height) / 2 + root.viewer-pan-y * parent.height;
-                image-fit: contain;
-                source: root.viewer-image;
-            }
-        }
-
-        // Единый инпут: колесо — зум, ЛКМ-перетаскивание — панорама (при зуме),
-        // одиночный ЛКМ по видео — пауза, СКМ — сброс зума. Под контролами по
-        // z-order (объявлен раньше нижней/верхней панелей).
-        zoom-ta := TouchArea {
-            width: 100%;
-            height: 100%;
-            property <bool> dragging: false;
-            property <float> px-start;
-            property <float> py-start;
-            property <float> nz; // новый зум (временное, для zoom-at)
-
-            // Любое движение мыши (даже без нажатия) — показать контролы.
-            // `moved` в Slint срабатывает только при зажатой кнопке, поэтому
-            // ловим изменение позиции курсора напрямую.
-            changed mouse-x => { root.viewer-activity(); }
-            changed mouse-y => { root.viewer-activity(); }
-
-            // Зум к точке под курсором: удерживаем точку картинки под курсором
-            // на месте, пересчитывая пан. sx/sy — доля вьюпорта под курсором;
-            // root.viewer-zoom здесь ещё СТАРЫЙ, self.nz — новый. Картинка —
-            // «бокс» W·zoom, центрированный и сдвинутый на pan·W; выводим pan'
-            // из условия «доля бокса под курсором не меняется».
-            function zoom-at(sx: float, sy: float) {
-                root.viewer-pan-x = sx
-                    - self.nz * (sx - (1 - root.viewer-zoom) / 2 - root.viewer-pan-x) / root.viewer-zoom
-                    - (1 - self.nz) / 2;
-                root.viewer-pan-y = sy
-                    - self.nz * (sy - (1 - root.viewer-zoom) / 2 - root.viewer-pan-y) / root.viewer-zoom
-                    - (1 - self.nz) / 2;
-                root.viewer-zoom = self.nz;
-            }
-
-            scroll-event(e) => {
-                self.nz = Math.clamp(
-                    root.viewer-zoom * (e.delta-y > 0 ? 1.1 : 0.9), 1.0, 8.0);
-                if (self.nz <= 1.0) {
-                    root.viewer-zoom = 1.0;
-                    root.viewer-pan-x = 0;
-                    root.viewer-pan-y = 0;
-                } else {
-                    self.zoom-at(self.mouse-x / self.width, self.mouse-y / self.height);
-                }
-                root.viewer-transform-changed();
-                root.viewer-activity();
-                return accept;
-            }
-            pointer-event(e) => {
-                if (e.kind == PointerEventKind.down) {
-                    if (e.button == PointerEventButton.middle) {
-                        root.viewer-zoom = 1.0;
-                        root.viewer-pan-x = 0;
-                        root.viewer-pan-y = 0;
-                        root.viewer-transform-changed();
-                    } else if (e.button == PointerEventButton.left) {
-                        self.dragging = false;
-                        self.px-start = root.viewer-pan-x;
-                        self.py-start = root.viewer-pan-y;
-                    }
-                    root.viewer-activity();
-                }
-                if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
-                    if (!self.dragging && root.viewer-is-video) {
-                        root.viewer-toggle-play();
-                    }
-                    key-fs.focus();
-                }
-            }
-            // Двойной клик по видео — на весь экран (как кнопка ⛶).
-            double-clicked => {
-                if (root.viewer-is-video) {
-                    root.viewer-toggle-fullscreen();
-                }
-            }
-            // Порог клик/перетаскивание и панораму считаем от pressed-x/pressed-y,
-            // которые Slint выставляет по реальной точке нажатия (иначе первое
-            // событие после ползунка ловит устаревший mouse-x).
-            moved => {
-                if (self.pressed) {
-                    if (Math.abs(self.mouse-x - self.pressed-x) > 3px
-                            || Math.abs(self.mouse-y - self.pressed-y) > 3px) {
-                        self.dragging = true;
-                    }
-                    if (root.viewer-zoom > 1.0) {
-                        root.viewer-pan-x = self.px-start + (self.mouse-x - self.pressed-x) / self.width;
-                        root.viewer-pan-y = self.py-start + (self.mouse-y - self.pressed-y) / self.height;
-                        root.viewer-transform-changed();
-                    }
-                }
-                root.viewer-activity();
-            }
-        }
-
-        // Полоса тегов файла: назначенные чипы + поле добавления
-        Rectangle {
-            y: 0;
-            height: 46px;
-            width: 100%;
-            background: #000000bb;
-            visible: root.viewer-controls-visible;
-            HorizontalLayout {
-                padding-left: 8px;
-                padding-right: 8px;
-                padding-top: 8px;
-                padding-bottom: 8px;
-                spacing: 6px;
-                alignment: start;
-
-                for t in root.viewer-tags: Rectangle {
-                    background: #2e7d32;
-                    border-radius: 8px;
-
-                    // Поглощает клики по чипу (не проваливаются на видео);
-                    // ПКМ — контекстное меню действий над фильтром.
-                    chip-bg := TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        clicked => { }
-                        pointer-event(event) => {
-                            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
-                                menu-popup.show();
-                            }
-                        }
-                    }
-
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 6px;
-                        spacing: 6px;
-                        Text {
-                            text: t.name;
-                            color: white;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-                        // Крестик — удаление только по нему (с подтверждением)
-                        Rectangle {
-                            width: 18px;
-                            Text {
-                                text: "✕";
-                                color: xta.has-hover ? #ffd0d0 : #ffffffbb;
-                                font-size: 12px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            xta := TouchArea {
-                                clicked => { confirm-popup.show(); }
-                            }
-                        }
-                    }
-
-                    // Подтверждение под тегом; клик вне окна = отмена.
-                    confirm-popup := PopupWindow {
-                        x: 0px;
-                        y: parent.height + 3px;
-                        width: 148px;
-                        height: 62px;
-                        close-policy: close-on-click-outside;
-                        Rectangle {
-                            background: #2a2a32;
-                            border-radius: 6px;
-                            border-width: 1px;
-                            border-color: #4a4a54;
-                            VerticalLayout {
-                                padding: 8px;
-                                spacing: 6px;
-                                Text {
-                                    text: "Удалить тег?";
-                                    color: #e6e6e6;
-                                    font-size: 12px;
-                                    horizontal-alignment: center;
-                                }
-                                HorizontalLayout {
-                                    spacing: 6px;
-                                    Rectangle {
-                                        height: 24px;
-                                        background: cta.has-hover ? #3a3a44 : #303038;
-                                        border-radius: 4px;
-                                        Text {
-                                            text: "Cancel";
-                                            color: #dddddd;
-                                            font-size: 12px;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                        }
-                                        cta := TouchArea {
-                                            clicked => { confirm-popup.close(); }
-                                        }
-                                    }
-                                    Rectangle {
-                                        height: 24px;
-                                        background: ota.has-hover ? #c0392b : #a03028;
-                                        border-radius: 4px;
-                                        Text {
-                                            text: "Ok";
-                                            color: white;
-                                            font-size: 12px;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                        }
-                                        ota := TouchArea {
-                                            clicked => {
-                                                root.toggle-file-tag(t.id);
-                                                confirm-popup.close();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // ПКМ-меню: действия над строкой фильтра
-                    menu-popup := PopupWindow {
-                        x: 0px;
-                        y: parent.height + 3px;
-                        width: 190px;
-                        height: 96px;
-                        close-policy: close-on-click-outside;
-                        Rectangle {
-                            background: #2a2a32;
-                            border-radius: 6px;
-                            border-width: 1px;
-                            border-color: #4a4a54;
-                            VerticalLayout {
-                                padding: 4px;
-                                spacing: 2px;
-                                Rectangle {
-                                    height: 28px;
-                                    background: mi1.has-hover ? #3a3a44 : transparent;
-                                    border-radius: 4px;
-                                    Text {
-                                        x: 10px;
-                                        text: "Добавить в фильтр";
-                                        color: #dddddd;
-                                        font-size: 12px;
-                                        vertical-alignment: center;
-                                    }
-                                    mi1 := TouchArea {
-                                        clicked => { root.filter-add-include(t.name); menu-popup.close(); }
-                                    }
-                                }
-                                Rectangle {
-                                    height: 28px;
-                                    background: mi2.has-hover ? #3a3a44 : transparent;
-                                    border-radius: 4px;
-                                    Text {
-                                        x: 10px;
-                                        text: "Добавить в исключение";
-                                        color: #dddddd;
-                                        font-size: 12px;
-                                        vertical-alignment: center;
-                                    }
-                                    mi2 := TouchArea {
-                                        clicked => { root.filter-add-exclude(t.name); menu-popup.close(); }
-                                    }
-                                }
-                                Rectangle {
-                                    height: 28px;
-                                    background: mi3.has-hover ? #3a3a44 : transparent;
-                                    border-radius: 4px;
-                                    Text {
-                                        x: 10px;
-                                        text: "Убрать из поиска";
-                                        color: #dddddd;
-                                        font-size: 12px;
-                                        vertical-alignment: center;
-                                    }
-                                    mi3 := TouchArea {
-                                        clicked => { root.filter-remove(t.name); menu-popup.close(); }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                add-edit := LineEdit {
-                    width: 160px;
-                    placeholder-text: "+ тег";
-                    // приглушаем поле над картинкой, пока оно пустое
-                    opacity: root.add-tag-text == "" ? 0.5 : 1.0;
-                    text <=> root.add-tag-text;
-                    edited(t) => { root.add-suggest-idx = -1; root.add-tag-edited(t); }
-                    accepted(t) => { root.add-suggest-idx = -1; root.add-tag-commit(t); }
-                    // ↑/↓ — выбрать подсказку и подставить её текст в поле.
-                    key-pressed(event) => {
-                        if (root.add-tag-suggestions.length > 0 && event.text == Key.DownArrow) {
-                            root.add-suggest-idx = root.add-suggest-idx + 1 >= root.add-tag-suggestions.length
-                                ? 0 : root.add-suggest-idx + 1;
-                            root.add-tag-text = root.add-tag-suggestions[root.add-suggest-idx];
-                            return EventResult.accept;
-                        }
-                        if (root.add-tag-suggestions.length > 0 && event.text == Key.UpArrow) {
-                            root.add-suggest-idx = root.add-suggest-idx <= 0
-                                ? root.add-tag-suggestions.length - 1 : root.add-suggest-idx - 1;
-                            root.add-tag-text = root.add-tag-suggestions[root.add-suggest-idx];
-                            return EventResult.accept;
-                        }
-                        return EventResult.reject;
-                    }
-                }
-            }
-
-            // Выпадающие подсказки под полем (у левого края полосы)
-            if root.add-tag-suggestions.length > 0: Rectangle {
-                x: 8px;
-                y: 46px;
-                width: 200px;
-                height: Math.min(root.add-tag-suggestions.length, 6) * 26px;
-                background: #202028;
-                border-radius: 4px;
-                VerticalLayout {
-                    for s[i] in root.add-tag-suggestions: Rectangle {
-                        height: 26px;
-                        background: (i == root.add-suggest-idx || asug-ta.has-hover) ? #2f2f3a : transparent;
-                        Text {
-                            x: 8px;
-                            width: parent.width - 16px;
-                            text: s;
-                            color: #dddddd;
-                            font-size: 13px;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                        asug-ta := TouchArea {
-                            // Пока поле ввода в фокусе, первый клик по подсказке
-                            // тратится на перенос фокуса обратно в key-fs (в модалке
-                            // FocusScope нет — там проблемы нет). Уводим фокус заранее,
-                            // при наведении, чтобы сам клик уже ничего не переносил.
-                            changed has-hover => {
-                                if (self.has-hover) { key-fs.focus(); }
-                            }
-                            clicked => { root.pick-add-suggestion(s); }
-                        }
-                    }
-                }
-            }
-
-            // Разметка фрагмента: «Начало» → запоминает позицию, «Конец» → её же
-            // фиксирует и (если диапазон валиден) открывает форму метаданных.
-            if root.viewer-is-video: Rectangle {
-                x: parent.width - self.width - 8px - 50px - 156px - 8px;
-                y: 8px;
-                width: 170px;
-                height: 30px;
-                border-radius: 6px;
-                background: !root.frag-buttons-disabled && fragm-ta.has-hover ? #3a3a48 : #2a2a32;
-                opacity: root.frag-buttons-disabled ? 0.5 : 1.0;
-                Text {
-                    text: root.frag-marking ? "End fragment" : "Start fragment";
-                    color: #e6e6e6;
-                    font-size: 12px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-                fragm-ta := TouchArea {
-                    enabled: !root.frag-buttons-disabled;
-                    clicked => { root.frag-mark-clicked(); }
-                }
-            }
-
-            // Справа: сделать текущий кадр видео миниатюрой файла.
-            if root.viewer-is-video: Rectangle {
-                x: parent.width - self.width - 8px - 50px;
-                y: 8px;
-                width: 156px;
-                height: 30px;
-                border-radius: 6px;
-                background: sett-ta.has-hover ? #3a3a48 : #2a2a32;
-                Text {
-                    text: "Set as thumbnail";
-                    color: #e6e6e6;
-                    font-size: 12px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-                sett-ta := TouchArea {
-                    clicked => { root.viewer-set-thumbnail(); }
-                }
-            }
-
-            CtrlBtn {
-                x: parent.width - self.width - 8px;
-                y: 8px;
-                label: "✕";
-                height: 30px;
-                fsize: 16px;
-                w: 44px;
-                clicked => { root.viewer-close(); }
-            }
-        }
-
-        // Нижняя панель управления
-        Rectangle {
-            y: parent.height - 56px;
-            height: 56px;
-            width: 100%;
-            background: #000000cc;
-            visible: root.viewer-controls-visible;
-
-            HorizontalLayout {
-                padding-left: 10px;
-                padding-right: 10px;
-                spacing: 4px;
-
-                // --- Видео: полный набор контролов ---
-                if root.viewer-is-video: CtrlBtn {
-                    label: "⏪";
-                    fsize: 15px;
-                    clicked => { root.viewer-skip(-10); }
-                }
-                if root.viewer-is-video: CtrlBtn {
-                    label: "◀5";
-                    fsize: 13px;
-                    clicked => { root.viewer-skip(-5); }
-                }
-                if root.viewer-is-video: CtrlBtn {
-                    label: "⏮";
-                    fsize: 15px;
-                    clicked => { root.viewer-frame-step(-1); }
-                }
-                if root.viewer-is-video: CtrlBtn {
-                    label: root.viewer-paused ? "▶" : "⏸";
-                    fsize: 18px;
-                    w: 44px;
-                    clicked => { root.viewer-toggle-play(); }
-                }
-                if root.viewer-is-video: CtrlBtn {
-                    label: "⏭";
-                    fsize: 15px;
-                    clicked => { root.viewer-frame-step(1); }
-                }
-                if root.viewer-is-video: CtrlBtn {
-                    label: "5▶";
-                    fsize: 13px;
-                    clicked => { root.viewer-skip(5); }
-                }
-                if root.viewer-is-video: CtrlBtn {
-                    label: "⏩";
-                    fsize: 15px;
-                    clicked => { root.viewer-skip(10); }
-                }
-
-                if root.viewer-is-video: Text {
-                    text: root.viewer-time-text;
-                    color: #dddddd;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
-
-                if root.viewer-is-video: MediaSlider {
-                    horizontal-stretch: 1;
-                    minimum: 0;
-                    maximum: Math.max(1, root.viewer-duration);
-                    value <=> root.viewer-pos;
-                    changed(v) => { root.viewer-seek(v); }
-                    fragments: root.viewer-fragments;
-                    frag-edit(id) => { root.frag-edit(id); }
-                    frag-delete-request(id) => { root.frag-delete-request(id); }
-                }
-
-                // Скорость
-                if root.viewer-is-video: CtrlBtn {
-                    label: root.viewer-speed + "x";
-                    fsize: 12px;
-                    w: 46px;
-                    clicked => { root.viewer-cycle-speed(); }
-                }
-                // Луп
-                if root.viewer-is-video: CtrlBtn {
-                    label: "🔁";
-                    fsize: 15px;
-                    active: root.viewer-loop;
-                    clicked => { root.viewer-toggle-loop(); }
-                }
-                // Mute
-                if root.viewer-is-video: CtrlBtn {
-                    label: root.viewer-muted ? "🔇" : "🔊";
-                    fsize: 14px;
-                    clicked => { root.viewer-toggle-mute(); }
-                }
-                // Громкость (колесо над ползунком тоже меняет громкость: слайдер
-                // не ловит scroll, поэтому событие всплывает к этой TouchArea).
-                if root.viewer-is-video: TouchArea {
-                    width: 84px;
-                    scroll-event(e) => {
-                        root.viewer-volume = Math.clamp(
-                            root.viewer-volume + (e.delta-y > 0 ? 5 : -5), 0, 100);
-                        root.viewer-set-volume(root.viewer-volume);
-                        return accept;
-                    }
-                    MediaSlider {
-                        width: 100%;
-                        height: 100%;
-                        minimum: 0;
-                        maximum: 100;
-                        value <=> root.viewer-volume;
-                        changed(v) => { root.viewer-set-volume(v); }
-                    }
-                }
-
-                // --- Изображение: имя файла ---
-                if !root.viewer-is-video: Text {
-                    horizontal-stretch: 1;
-                    text: root.viewer-name;
-                    color: #dddddd;
-                    overflow: elide;
-                    vertical-alignment: center;
-                }
-
-                // Полноэкранный + закрыть (общие)
-                CtrlBtn {
-                    label: root.viewer-fullscreen ? "🗗" : "⛶";
-                    fsize: 15px;
-                    clicked => { root.viewer-toggle-fullscreen(); }
-                }
-            }
-        }
-
-        // Клавиатура: Esc — закрыть, пробел — play/pause, стрелки — перемотка,
-        // f — полный экран (для видео).
-        key-fs := FocusScope {
-            key-pressed(event) => {
-                if (event.text == Key.Escape) {
-                    if (root.viewer-fullscreen) {
-                        root.viewer-toggle-fullscreen();
-                    } else {
-                        root.viewer-close();
-                    }
-                    return EventResult.accept;
-                }
-                if (event.text == " " && root.viewer-is-video) {
-                    root.viewer-toggle-play();
-                    return EventResult.accept;
-                }
-                if (event.text == Key.LeftArrow && root.viewer-is-video) {
-                    root.viewer-skip(-5);
-                    return EventResult.accept;
-                }
-                if (event.text == Key.RightArrow && root.viewer-is-video) {
-                    root.viewer-skip(5);
-                    return EventResult.accept;
-                }
-                if (event.text == "f" && root.viewer-is-video) {
-                    root.viewer-toggle-fullscreen();
-                    return EventResult.accept;
-                }
-                return EventResult.reject;
-            }
-            init => { self.focus(); }
-        }
-
-        // --- Оверлей: метаданные фрагмента (создание/редактирование) ---
-        if root.frag-editor-open : Rectangle {
-            width: 100%;
-            height: 100%;
-            background: #000000aa;
-            TouchArea { clicked => { root.frag-editor-cancel(); } }
-
-            Rectangle {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: 340px;
-                height: 260px;
-                background: #23232b;
-                border-radius: 8px;
-                border-width: 1px;
-                border-color: #4a4a54;
-                TouchArea { }
-                VerticalLayout {
-                    padding: 16px;
-                    spacing: 10px;
-                    Text {
-                        text: root.frag-editor-heading;
-                        color: #e6e6e6;
-                        font-size: 15px;
-                        horizontal-alignment: center;
-                    }
-                    Text {
-                        text: "Title";
-                        color: #9a9aa4;
-                        font-size: 11px;
-                    }
-                    LineEdit {
-                        text <=> root.frag-editor-title-text;
-                        placeholder-text: "Fragment title";
-                        // Плейсхолдер полупрозрачный: тускнеет всё поле, пока
-                        // оно пустое (реальный текст сверху даёт непрозрачность).
-                        opacity: root.frag-editor-title-text == "" ? 0.5 : 1.0;
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout {
-                            spacing: 4px;
-                            Text { text: "Start (m:ss)"; color: #9a9aa4; font-size: 11px; }
-                            LineEdit { text <=> root.frag-editor-start-text; }
-                        }
-                        VerticalLayout {
-                            spacing: 4px;
-                            Text { text: "End (m:ss)"; color: #9a9aa4; font-size: 11px; }
-                            LineEdit { text <=> root.frag-editor-end-text; }
-                        }
-                    }
-                    Rectangle { vertical-stretch: 1; }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Rectangle {
-                            height: 32px;
-                            background: fecancel.has-hover ? #3a3a44 : #303038;
-                            border-radius: 5px;
-                            Text {
-                                text: "Cancel";
-                                color: #dddddd;
-                                font-size: 13px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            fecancel := TouchArea {
-                                clicked => { root.frag-editor-cancel(); }
-                            }
-                        }
-                        Rectangle {
-                            height: 32px;
-                            background: fesave.has-hover ? #5a9bc0 : #4a8bb0;
-                            border-radius: 5px;
-                            Text {
-                                text: "Save";
-                                color: white;
-                                font-size: 13px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            fesave := TouchArea {
-                                clicked => { root.frag-editor-save(); }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- Оверлей: ошибка валидации диапазона фрагмента ---
-        if root.frag-error-open : Rectangle {
-            width: 100%;
-            height: 100%;
-            background: #000000aa;
-            TouchArea { clicked => { root.frag-error-ok(); } }
-
-            Rectangle {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: 320px;
-                height: 130px;
-                background: #23232b;
-                border-radius: 8px;
-                border-width: 1px;
-                border-color: #6a3a3a;
-                TouchArea { }
-                VerticalLayout {
-                    padding: 16px;
-                    spacing: 14px;
-                    Text {
-                        text: root.frag-error-text;
-                        color: #ecc0c0;
-                        font-size: 13px;
-                        wrap: word-wrap;
-                        horizontal-alignment: center;
-                        vertical-stretch: 1;
-                        vertical-alignment: center;
-                    }
-                    Rectangle {
-                        height: 32px;
-                        background: feok.has-hover ? #3a3a44 : #303038;
-                        border-radius: 5px;
-                        Text {
-                            text: "OK";
-                            color: #dddddd;
-                            font-size: 13px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                        feok := TouchArea {
-                            clicked => { root.frag-error-ok(); }
-                        }
-                    }
-                }
-            }
-        }
-
-        // --- Оверлей: подтверждение удаления фрагмента ---
-        if root.frag-delete-confirm-open : Rectangle {
-            width: 100%;
-            height: 100%;
-            background: #000000aa;
-            TouchArea { clicked => { root.frag-delete-confirm-cancel(); } }
-
-            Rectangle {
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                width: 300px;
-                height: 120px;
-                background: #23232b;
-                border-radius: 8px;
-                border-width: 1px;
-                border-color: #6a3a3a;
-                TouchArea { }
-                VerticalLayout {
-                    padding: 16px;
-                    spacing: 14px;
-                    Text {
-                        text: "Delete fragment?";
-                        color: #ecc0c0;
-                        font-size: 14px;
-                        horizontal-alignment: center;
-                        vertical-stretch: 1;
-                        vertical-alignment: center;
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Rectangle {
-                            height: 32px;
-                            background: fdcancel.has-hover ? #3a3a44 : #303038;
-                            border-radius: 5px;
-                            Text {
-                                text: "Cancel";
-                                color: #dddddd;
-                                font-size: 13px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            fdcancel := TouchArea {
-                                clicked => { root.frag-delete-confirm-cancel(); }
-                            }
-                        }
-                        Rectangle {
-                            height: 32px;
-                            background: fdok.has-hover ? #c0392b : #a03028;
-                            border-radius: 5px;
-                            Text {
-                                text: "Delete";
-                                color: white;
-                                font-size: 13px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            fdok := TouchArea {
-                                clicked => { root.frag-delete-confirm-ok(); }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        viewer-detach() => { root.viewer-detach(); }
+        viewer-is-video: root.viewer-is-video;
+        viewer-image: root.viewer-image;
+        viewer-name: root.viewer-name;
+        viewer-paused: root.viewer-paused;
+        viewer-pos <=> root.viewer-pos;
+        viewer-duration: root.viewer-duration;
+        viewer-volume <=> root.viewer-volume;
+        viewer-muted: root.viewer-muted;
+        viewer-speed: root.viewer-speed;
+        viewer-loop: root.viewer-loop;
+        viewer-fullscreen: root.viewer-fullscreen;
+        viewer-time-text: root.viewer-time-text;
+        viewer-controls-visible: root.viewer-controls-visible;
+        viewer-zoom <=> root.viewer-zoom;
+        viewer-pan-x <=> root.viewer-pan-x;
+        viewer-pan-y <=> root.viewer-pan-y;
+        viewer-tags: root.viewer-tags;
+        add-tag-text <=> root.add-tag-text;
+        add-tag-suggestions: root.add-tag-suggestions;
+        viewer-fragments: root.viewer-fragments;
+        frag-marking: root.frag-marking;
+        frag-buttons-disabled: root.frag-buttons-disabled;
+        frag-editor-open <=> root.frag-editor-open;
+        frag-editor-heading: root.frag-editor-heading;
+        frag-editor-title-text <=> root.frag-editor-title-text;
+        frag-editor-start-text <=> root.frag-editor-start-text;
+        frag-editor-end-text <=> root.frag-editor-end-text;
+        frag-error-open <=> root.frag-error-open;
+        frag-error-text: root.frag-error-text;
+        frag-delete-confirm-open <=> root.frag-delete-confirm-open;
+        viewer-close() => { root.viewer-close(); }
+        viewer-toggle-play() => { root.viewer-toggle-play(); }
+        viewer-seek(a0) => { root.viewer-seek(a0); }
+        viewer-skip(a0) => { root.viewer-skip(a0); }
+        viewer-frame-step(a0) => { root.viewer-frame-step(a0); }
+        viewer-set-volume(a0) => { root.viewer-set-volume(a0); }
+        viewer-toggle-mute() => { root.viewer-toggle-mute(); }
+        viewer-cycle-speed() => { root.viewer-cycle-speed(); }
+        viewer-toggle-loop() => { root.viewer-toggle-loop(); }
+        viewer-toggle-fullscreen() => { root.viewer-toggle-fullscreen(); }
+        viewer-activity() => { root.viewer-activity(); }
+        viewer-transform-changed() => { root.viewer-transform-changed(); }
+        toggle-file-tag(a0) => { root.toggle-file-tag(a0); }
+        add-tag-edited(a0) => { root.add-tag-edited(a0); }
+        add-tag-commit(a0) => { root.add-tag-commit(a0); }
+        pick-add-suggestion(a0) => { root.pick-add-suggestion(a0); }
+        viewer-set-thumbnail() => { root.viewer-set-thumbnail(); }
+        frag-mark-clicked() => { root.frag-mark-clicked(); }
+        frag-edit(a0) => { root.frag-edit(a0); }
+        frag-delete-request(a0) => { root.frag-delete-request(a0); }
+        frag-editor-save() => { root.frag-editor-save(); }
+        frag-editor-cancel() => { root.frag-editor-cancel(); }
+        frag-error-ok() => { root.frag-error-ok(); }
+        frag-delete-confirm-ok() => { root.frag-delete-confirm-ok(); }
+        frag-delete-confirm-cancel() => { root.frag-delete-confirm-cancel(); }
+        filter-add-include(a0) => { root.filter-add-include(a0); }
+        filter-add-exclude(a0) => { root.filter-add-exclude(a0); }
+        filter-remove(a0) => { root.filter-remove(a0); }
     }
 }

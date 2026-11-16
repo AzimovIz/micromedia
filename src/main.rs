@@ -12,6 +12,7 @@ mod paths;
 mod scanner;
 mod tree;
 mod videothumb;
+mod viewer;
 mod workers;
 
 use std::cell::{Cell, RefCell};
@@ -20,22 +21,12 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
-use slint::{ComponentHandle, GraphicsAPI, Model, ModelRc, RenderingState, VecModel};
+use slint::{ComponentHandle, GraphicsAPI, Model, ModelRc, VecModel};
 
-use mpv::{Mpv, MpvRenderContext};
+use mpv::Mpv;
 
 slint::include_modules!();
 
-/// Колбэк «у mpv готов новый кадр» — просим Slint перерисоваться.
-unsafe extern "C" fn on_mpv_update(ctx: *mut std::ffi::c_void) {
-    let weak = &*(ctx as *const slint::Weak<MainWindow>);
-    let weak = weak.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(win) = weak.upgrade() {
-            win.window().request_redraw();
-        }
-    });
-}
 
 /// Размер в строку для UI: пусто, если неизвестно (NULL) или не определить (-1).
 fn fmt_dim(v: Option<i64>) -> slint::SharedString {
@@ -350,16 +341,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // --- Состояние ---
-    let current_open_id: Rc<Cell<i64>> = Rc::new(Cell::new(-1));
-    // Фрагменты открытого видео: кэш для проверки пересечений и заполнения
-    // редактора (без похода в БД на каждый клик).
-    let current_fragments: Rc<RefCell<Vec<db::Fragment>>> = Rc::new(RefCell::new(Vec::new()));
-    // Стартовая точка разметки (мс), пока не нажата «Конец фрагмента».
-    let frag_marking_start: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(None));
-    // id редактируемого фрагмента в оверлее метаданных; -1 = создание нового.
-    let frag_editing_id: Rc<Cell<i64>> = Rc::new(Cell::new(-1));
-    // id фрагмента, ожидающего подтверждения удаления.
-    let frag_delete_target: Rc<Cell<i64>> = Rc::new(Cell::new(-1));
     // Мультивыбор (вид «Список»): выбранные id, раскрытые папки, зеркало дерева.
     let selected: Rc<RefCell<std::collections::HashSet<i64>>> =
         Rc::new(RefCell::new(std::collections::HashSet::new()));
@@ -456,48 +437,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // Теги открытого файла (назначенные) для чипов просмотрщика.
-    let rebuild_viewer_tags: Rc<dyn Fn(i64)> = {
-        let weak = window.as_weak();
-        let ui_db = ui_db.clone();
-        Rc::new(move |id: i64| {
-            if let Some(w) = weak.upgrade() {
-                let items: Vec<TagItem> = ui_db
-                    .tags_for_file(id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|t| TagItem {
-                        id: t.id as i32,
-                        name: t.name.into(),
-                    })
-                    .collect();
-                w.set_viewer_tags(ModelRc::new(VecModel::from(items)));
-            }
-        })
-    };
-
-    // Фрагменты открытого видео: обновляет кэш + модель для полоски/оверлея.
-    let rebuild_viewer_fragments: Rc<dyn Fn(i64)> = {
-        let weak = window.as_weak();
-        let ui_db = ui_db.clone();
-        let current_fragments = current_fragments.clone();
-        Rc::new(move |id: i64| {
-            let list = ui_db.fragments_for_file(id).unwrap_or_default();
-            if let Some(w) = weak.upgrade() {
-                let items: Vec<FragmentItem> = list
-                    .iter()
-                    .map(|f| FragmentItem {
-                        id: f.id as i32,
-                        start: f.start_ms as f32 / 1000.0,
-                        end: f.end_ms as f32 / 1000.0,
-                        title: f.title.clone().into(),
-                    })
-                    .collect();
-                w.set_viewer_fragments(ModelRc::new(VecModel::from(items)));
-            }
-            *current_fragments.borrow_mut() = list;
-        })
-    };
 
     // --- Редактор тегов одного файла (модалка) ---
     // Отдельный от просмотрщика id, чтобы редактор не конфликтовал с открытым
@@ -736,115 +675,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Контекстное меню тега: изменение строки фильтра по имени тега.
+    // Контекстное меню тега: изменение строки фильтра по имени тега
+    // (из боковой панели и из чипов плеера — в т.ч. в отдельных окнах).
+    let filter_op: Rc<dyn Fn(slint::SharedString, TokenOp)> = {
+        let weak = window.as_weak();
+        let rebuild_gallery = rebuild_gallery.clone();
+        let save_config = save_config.clone();
+        Rc::new(move |name, op| {
+            if let Some(w) = weak.upgrade() {
+                let new = set_filter_token(&w.get_filter_text(), name.as_str(), op);
+                w.set_filter_text(new.into());
+                w.set_filter_suggestions(strings_model(Vec::new()));
+            }
+            rebuild_gallery();
+            save_config();
+        })
+    };
     {
-        let apply: Rc<dyn Fn(slint::SharedString, TokenOp)> = {
-            let weak = window.as_weak();
-            let rebuild_gallery = rebuild_gallery.clone();
-            let save_config = save_config.clone();
-            Rc::new(move |name, op| {
-                if let Some(w) = weak.upgrade() {
-                    let new = set_filter_token(&w.get_filter_text(), name.as_str(), op);
-                    w.set_filter_text(new.into());
-                    w.set_filter_suggestions(strings_model(Vec::new()));
-                }
-                rebuild_gallery();
-                save_config();
-            })
-        };
-        let a1 = apply.clone();
+        let a1 = filter_op.clone();
         window.on_filter_add_include(move |name| a1(name, TokenOp::Include));
-        let a2 = apply.clone();
+        let a2 = filter_op.clone();
         window.on_filter_add_exclude(move |name| a2(name, TokenOp::Exclude));
-        let a3 = apply.clone();
+        let a3 = filter_op.clone();
         window.on_filter_remove(move |name| a3(name, TokenOp::Remove));
     }
 
-    // --- Назначение тегов файлу (чипы + добавление с автодополнением) ---
-    // Общая логика «назначить тег по имени (создать при необходимости)».
-    let assign_by_name: Rc<dyn Fn(&str)> = {
-        let weak = window.as_weak();
-        let ui_db = ui_db.clone();
-        let current = current_open_id.clone();
-        let rebuild_viewer_tags = rebuild_viewer_tags.clone();
-        let rebuild_gallery = rebuild_gallery.clone();
-        Rc::new(move |name: &str| {
-            let id = current.get();
-            let name = name.trim();
-            if id < 0 || name.is_empty() {
-                return;
-            }
-            match ui_db.create_tag(name, now_unix()) {
-                Ok(tag_id) => {
-                    if let Err(e) = ui_db.assign_tag(id, tag_id) {
-                        log::error!("assign_tag: {e}");
-                    }
-                }
-                Err(e) => log::error!("create_tag: {e}"),
-            }
-            if let Some(w) = weak.upgrade() {
-                w.set_add_tag_text("".into());
-                w.set_add_tag_suggestions(strings_model(Vec::new()));
-            }
-            rebuild_viewer_tags(id);
-            rebuild_gallery();
-        })
-    };
+    // Контекст для плееров (встроенного и отдельных окон).
+    let app = Rc::new(viewer::App {
+        db: ui_db.clone(),
+        media: paths.media.clone(),
+        thumbs: paths.thumbnails.clone(),
+        main: window.as_weak(),
+        rebuild_gallery: rebuild_gallery.clone(),
+        tag_names: Rc::new(tag_names.clone()),
+        filter_op: filter_op.clone(),
+        save_config: save_config.clone(),
+        players: RefCell::new(Vec::new()),
+    });
 
-    {
-        let weak = window.as_weak();
-        let ui_db = ui_db.clone();
-        let tag_names = tag_names.clone();
-        let current = current_open_id.clone();
-        window.on_add_tag_edited(move |text| {
-            if let Some(w) = weak.upgrade() {
-                let id = current.get();
-                let assigned: std::collections::HashSet<String> = if id >= 0 {
-                    ui_db
-                        .tags_for_file(id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|t| t.name)
-                        .collect()
-                } else {
-                    std::collections::HashSet::new()
-                };
-                let sug = suggest(text.trim(), &tag_names(), &assigned);
-                w.set_add_tag_suggestions(strings_model(sug));
-            }
-        });
-    }
-
-    {
-        let assign_by_name = assign_by_name.clone();
-        window.on_add_tag_commit(move |text| assign_by_name(&text));
-    }
-
-    {
-        let assign_by_name = assign_by_name.clone();
-        window.on_pick_add_suggestion(move |chosen| assign_by_name(&chosen));
-    }
-
-    // Клик по назначенному чипу — снять тег.
-    {
-        let ui_db = ui_db.clone();
-        let rebuild_viewer_tags = rebuild_viewer_tags.clone();
-        let rebuild_gallery = rebuild_gallery.clone();
-        let current = current_open_id.clone();
-        window.on_toggle_file_tag(move |tag_id| {
-            let id = current.get();
-            if id < 0 {
-                return;
-            }
-            if let Err(e) = ui_db.unassign_tag(id, tag_id as i64) {
-                log::error!("unassign_tag: {e}");
-            }
-            // Если у тега не осталось ни одного файла — удаляем сам тег.
-            let _ = ui_db.delete_tag_if_orphan(tag_id as i64);
-            rebuild_viewer_tags(id);
-            rebuild_gallery();
-        });
-    }
 
     // --- Обработчики редактора тегов (модалка) ---
     // Открытие: из плитки по file-id, из списка — по idx строки дерева.
@@ -1194,87 +1062,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Гейт: рисуем mpv-подложку только когда открыт видео-просмотр.
-    let render_video: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // --- Встроенный просмотрщик (поверх галереи) ---
+    let main_viewer_state = viewer::ViewerState::new(mpv_opt.clone(), false);
+    viewer::main_viewer::wire(&window, &main_viewer_state, &app);
 
     // Открытие файла: фото → показать в оверлее; видео → загрузить в mpv.
-    // --- Состояние расширенного плеера ---
-    let fullscreen: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let speed_idx: Rc<Cell<usize>> = Rc::new(Cell::new(2)); // 1.0x
-    let muted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let loop_on: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-    let last_activity: Rc<Cell<std::time::Instant>> =
-        Rc::new(Cell::new(std::time::Instant::now()));
-
     let open_file: Rc<dyn Fn(i32)> = {
         let weak = window.as_weak();
-        let ui_db = ui_db.clone();
-        let media = paths.media.clone();
-        let mpv = mpv_opt.clone();
-        let render_video = render_video.clone();
-        let current = current_open_id.clone();
-        let rebuild_viewer_tags = rebuild_viewer_tags.clone();
-        let rebuild_viewer_fragments = rebuild_viewer_fragments.clone();
-        let frag_marking_start = frag_marking_start.clone();
-        let loop_on = loop_on.clone();
+        let st = main_viewer_state.clone();
+        let app = app.clone();
         Rc::new(move |id: i32| {
-            let Some(w) = weak.upgrade() else { return };
-            match ui_db.file_info(id as i64) {
-                Ok(Some((rel, mt))) => {
-                    let full = media.join(&rel);
-                    current.set(id as i64);
-                    rebuild_viewer_tags(id as i64);
-                    rebuild_viewer_fragments(id as i64);
-                    // Смена файла отменяет незавершённую разметку фрагмента.
-                    frag_marking_start.set(None);
-                    w.set_frag_marking(false);
-                    w.set_add_tag_text("".into());
-                    w.set_add_tag_suggestions(strings_model(Vec::new()));
-                    w.set_viewer_name(basename(&rel).into());
-                    // Сброс зума/панорамы при открытии нового файла.
-                    w.set_viewer_zoom(1.0);
-                    w.set_viewer_pan_x(0.0);
-                    w.set_viewer_pan_y(0.0);
-                    w.set_viewer_controls_visible(true);
-
-                    // Анимированные GIF проигрываем через mpv (анимация + луп),
-                    // получая заодно зум/пан/фуллскрин. mpv должен быть доступен.
-                    let is_gif = rel.to_lowercase().ends_with(".gif");
-                    let via_mpv = matches!(mt, db::MediaType::Video)
-                        || (is_gif && mpv.is_some());
-
-                    if via_mpv {
-                        if let Some(mpv) = &mpv {
-                            w.set_viewer_is_video(true);
-                            w.set_viewer_paused(false);
-                            w.set_viewer_pos(0.0);
-                            w.set_viewer_duration(0.0);
-                            w.set_viewer_open(true);
-                            render_video.set(true);
-                            // Сброс трансформации видео в mpv.
-                            mpv.set_video_zoom(1.0);
-                            mpv.set_video_pan(0.0, 0.0);
-                            // GIF по умолчанию зациклен; обычное видео — нет.
-                            loop_on.set(is_gif);
-                            mpv.set_loop(is_gif);
-                            w.set_viewer_loop(is_gif);
-                            if let Err(e) = mpv.loadfile(&full.to_string_lossy()) {
-                                log::error!("{e}");
-                            }
-                            w.window().request_redraw();
-                        }
-                    } else {
-                        render_video.set(false);
-                        match slint::Image::load_from_path(&full) {
-                            Ok(img) => w.set_viewer_image(img),
-                            Err(e) => log::warn!("Фото {rel}: {e}"),
-                        }
-                        w.set_viewer_is_video(false);
-                        w.set_viewer_open(true);
-                    }
-                }
-                Ok(None) => log::warn!("Файл id={id} не найден в БД"),
-                Err(e) => log::error!("file_info: {e}"),
+            if let Some(w) = weak.upgrade() {
+                viewer::main_viewer::open(&w, &st, &app, id as i64, 0.0, false);
             }
         })
     };
@@ -1283,6 +1082,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let open_file = open_file.clone();
         window.on_open_file(move |id| open_file(id));
     }
+
+    // «Детач»: текущий файл уезжает в новое окно плеера (со своим mpv) с той же
+    // позиции; встроенный плеер закрывается и главное окно возвращается к списку.
+    {
+        let weak = window.as_weak();
+        let st = main_viewer_state.clone();
+        let app = app.clone();
+        window.on_viewer_detach(move || {
+            let Some(w) = weak.upgrade() else { return };
+            let id = st.current.get();
+            if id < 0 {
+                return;
+            }
+            let (pos, paused) = match (&st.mpv, w.get_viewer_is_video()) {
+                (Some(mpv), true) => (
+                    mpv.get_double("time-pos").unwrap_or(0.0),
+                    mpv.get_flag("pause").unwrap_or(false),
+                ),
+                _ => (0.0, false),
+            };
+            let volume = w.get_viewer_volume();
+            w.invoke_viewer_close();
+            viewer::spawn_player(&app, id, pos, paused, volume);
+        });
+    }
+
+    // Закрытие главного окна завершает приложение целиком, даже если открыты
+    // отдельные окна плеера (иначе цикл событий жил бы до последнего окна).
+    window.window().on_close_requested(|| {
+        let _ = slint::quit_event_loop();
+        slint::CloseRequestResponse::HideWindow
+    });
 
     // Вид «Список»: одиночный клик — выделение (мгновенно), двойной —
     // открыть/раскрыть. Выделение обновляем НА МЕСТЕ (без пересборки модели),
@@ -1441,246 +1272,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        let render_video = render_video.clone();
-        let current = current_open_id.clone();
-        let fullscreen = fullscreen.clone();
-        window.on_viewer_close(move || {
-            if let Some(w) = weak.upgrade() {
-                if fullscreen.get() {
-                    w.window().set_fullscreen(false);
-                    fullscreen.set(false);
-                    w.set_viewer_fullscreen(false);
-                }
-                w.set_viewer_open(false);
-                w.set_viewer_is_video(false);
-                w.set_viewer_controls_visible(true);
-            }
-            current.set(-1);
-            render_video.set(false);
-            if let Some(mpv) = &mpv {
-                mpv.stop();
-            }
-        });
-    }
-
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        window.on_viewer_toggle_play(move || {
-            if let Some(mpv) = &mpv {
-                mpv.toggle_pause();
-                if let Some(w) = weak.upgrade() {
-                    w.set_viewer_paused(mpv.get_flag("pause").unwrap_or(false));
-                    w.window().request_redraw();
-                }
-            }
-        });
-    }
-
-    {
-        let mpv = mpv_opt.clone();
-        window.on_viewer_seek(move |secs| {
-            if let Some(mpv) = &mpv {
-                // Игнорируем «эхо» от таймера позиции: сеем только реальные скачки.
-                let cur = mpv.get_double("time-pos").unwrap_or(-1e9);
-                if (secs as f64 - cur).abs() > 0.75 {
-                    mpv.set_double("time-pos", secs as f64);
-                }
-            }
-        });
-    }
-
-    // Относительная перемотка (скипы ±5/±10).
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        window.on_viewer_skip(move |secs| {
-            if let Some(mpv) = &mpv {
-                mpv.seek_relative(secs as f64);
-                if let Some(w) = weak.upgrade() {
-                    w.window().request_redraw();
-                }
-            }
-        });
-    }
-
-    // Покадровый шаг (ставит на паузу).
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        window.on_viewer_frame_step(move |dir| {
-            if let Some(mpv) = &mpv {
-                mpv.frame_step(dir >= 0);
-                if let Some(w) = weak.upgrade() {
-                    w.set_viewer_paused(mpv.get_flag("pause").unwrap_or(true));
-                    w.window().request_redraw();
-                }
-            }
-        });
-    }
-
-    // Громкость.
-    {
-        let mpv = mpv_opt.clone();
-        let save_config = save_config.clone();
-        window.on_viewer_set_volume(move |v| {
-            if let Some(mpv) = &mpv {
-                mpv.set_volume(v as f64);
-            }
-            save_config();
-        });
-    }
-
-    // Mute.
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        let muted = muted.clone();
-        window.on_viewer_toggle_mute(move || {
-            let m = !muted.get();
-            muted.set(m);
-            if let Some(mpv) = &mpv {
-                mpv.set_flag("mute", m);
-            }
-            if let Some(w) = weak.upgrade() {
-                w.set_viewer_muted(m);
-            }
-        });
-    }
-
-    // Скорость (циклический перебор пресетов).
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        let speed_idx = speed_idx.clone();
-        window.on_viewer_cycle_speed(move || {
-            let i = (speed_idx.get() + 1) % SPEEDS.len();
-            speed_idx.set(i);
-            let s = SPEEDS[i];
-            if let Some(mpv) = &mpv {
-                mpv.set_speed(s);
-            }
-            if let Some(w) = weak.upgrade() {
-                w.set_viewer_speed(s as f32);
-            }
-        });
-    }
-
-    // Луп.
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        let loop_on = loop_on.clone();
-        window.on_viewer_toggle_loop(move || {
-            let l = !loop_on.get();
-            loop_on.set(l);
-            if let Some(mpv) = &mpv {
-                mpv.set_loop(l);
-            }
-            if let Some(w) = weak.upgrade() {
-                w.set_viewer_loop(l);
-            }
-        });
-    }
-
-    // Полноэкранный режим.
-    {
-        let weak = window.as_weak();
-        let fullscreen = fullscreen.clone();
-        let last_activity = last_activity.clone();
-        window.on_viewer_toggle_fullscreen(move || {
-            let fs = !fullscreen.get();
-            fullscreen.set(fs);
-            if let Some(w) = weak.upgrade() {
-                w.window().set_fullscreen(fs);
-                w.set_viewer_fullscreen(fs);
-                w.set_viewer_controls_visible(true);
-                last_activity.set(std::time::Instant::now());
-            }
-        });
-    }
-
-    // Активность мыши — сброс авто-скрытия контролов.
-    {
-        let weak = window.as_weak();
-        let last_activity = last_activity.clone();
-        window.on_viewer_activity(move || {
-            last_activity.set(std::time::Instant::now());
-            if let Some(w) = weak.upgrade() {
-                if !w.get_viewer_controls_visible() {
-                    w.set_viewer_controls_visible(true);
-                }
-            }
-        });
-    }
-
-    // Применение зума/панорамы к видео (для фото — чистый Slint).
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        window.on_viewer_transform_changed(move || {
-            let Some(w) = weak.upgrade() else { return };
-            if !w.get_viewer_is_video() {
-                return;
-            }
-            if let Some(mpv) = &mpv {
-                let z = w.get_viewer_zoom() as f64;
-                mpv.set_video_zoom(z);
-                // mpv `video-pan-*` — доля МАСШТАБИРОВАННОГО видео: при зуме та же
-                // доля даёт больший пиксельный сдвиг. Делим на зум, чтобы движение
-                // за курсором было 1:1 в пикселях окна (панораму копим как долю окна).
-                let inv = if z > 0.0 { 1.0 / z } else { 1.0 };
-                mpv.set_video_pan(
-                    w.get_viewer_pan_x() as f64 * inv,
-                    w.get_viewer_pan_y() as f64 * inv,
-                );
-                w.window().request_redraw();
-            }
-        });
-    }
-
-    // «Set as thumbnail»: текущий кадр видео → миниатюра файла.
-    // Снимок делаем на UI-потоке (mpv-хэндл не Send), но тяжёлый ресайз/энкод
-    // уводим в фоновый поток, чтобы не фризить интерфейс.
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        let current = current_open_id.clone();
-        let thumbs = paths.thumbnails.clone();
-        window.on_viewer_set_thumbnail(move || {
-            let id = current.get();
-            let Some(mpv) = &mpv else { return };
-            if id < 0 {
-                return;
-            }
-            let dst = thumbs.join(format!("{id}.jpg"));
-            // PNG, а не JPEG: сохранение в JPEG требует, чтобы libmpv была собрана
-            // с libjpeg, а портативная сборка идёт без него (docs/build-libmpv.md).
-            // PNG mpv умеет через zlib, который есть в любой сборке. В JPEG-миниатюру
-            // кадр всё равно перекодирует make_image_thumb.
-            let tmp = thumbs.join(format!("{id}.cap.png"));
-            // Быстрый снимок текущего кадра во временный файл (энкод одного кадра).
-            if let Err(e) = mpv.screenshot_to_file(&tmp.to_string_lossy()) {
-                log::error!("{e}");
-                return;
-            }
-            let weak = weak.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = crate::workers::make_image_thumb(&tmp, &dst) {
-                    log::error!("Миниатюра из кадра: {e}");
-                }
-                let _ = std::fs::remove_file(&tmp);
-                let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(w) = weak.upgrade() {
-                        w.invoke_thumb_updated(id as i32);
-                    }
-                });
-            });
-        });
-    }
 
     // Фоновая генерация миниатюры завершена — сбрасываем кэш и обновляем плитку.
     {
@@ -1696,240 +1287,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // --- Фрагменты видео ---
-
-    // Диапазон [start_ms,end_ms) не должен пересекать/включать ни один
-    // существующий фрагмент. `skip_id` — исключить сам редактируемый
-    // фрагмент (-1 при создании нового).
-    fn frag_overlaps(
-        fragments: &[db::Fragment],
-        start_ms: i64,
-        end_ms: i64,
-        skip_id: i64,
-    ) -> bool {
-        fragments
-            .iter()
-            .any(|f| f.id != skip_id && f.start_ms < end_ms && start_ms < f.end_ms)
-    }
-
-    // Клик по кнопке «Начало фрагмента» / «Конец фрагмента».
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        let frag_marking_start = frag_marking_start.clone();
-        let frag_editing_id = frag_editing_id.clone();
-        let current_fragments = current_fragments.clone();
-        window.on_frag_mark_clicked(move || {
-            let Some(w) = weak.upgrade() else { return };
-            let Some(mpv) = &mpv else { return };
-            let pos_ms = (mpv.get_double("time-pos").unwrap_or(0.0) * 1000.0) as i64;
-
-            match frag_marking_start.get() {
-                None => {
-                    frag_marking_start.set(Some(pos_ms));
-                    w.set_frag_marking(true);
-                }
-                Some(start_ms) => {
-                    frag_marking_start.set(None);
-                    w.set_frag_marking(false);
-                    let end_ms = pos_ms;
-                    let invalid = end_ms <= start_ms
-                        || frag_overlaps(&current_fragments.borrow(), start_ms, end_ms, -1);
-                    if invalid {
-                        w.set_frag_error_text("Invalid range: end is before start, or it overlaps another fragment.".into());
-                        w.set_frag_error_open(true);
-                        return;
-                    }
-                    frag_editing_id.set(-1);
-                    w.set_frag_editor_heading("New fragment".into());
-                    w.set_frag_editor_title_text("".into());
-                    w.set_frag_editor_start_text(fmt_mmss(start_ms).into());
-                    w.set_frag_editor_end_text(fmt_mmss(end_ms).into());
-                    w.set_frag_editor_open(true);
-                }
-            }
-        });
-    }
-
-    // Сохранение оверлея метаданных: и для создания, и для редактирования
-    // (поля start/end тоже редактируемые — валидация здесь же, повторно).
-    {
-        let weak = window.as_weak();
-        let ui_db = ui_db.clone();
-        let current = current_open_id.clone();
-        let frag_editing_id = frag_editing_id.clone();
-        let current_fragments = current_fragments.clone();
-        let rebuild_viewer_fragments = rebuild_viewer_fragments.clone();
-        window.on_frag_editor_save(move || {
-            let Some(w) = weak.upgrade() else { return };
-            let editing_id = frag_editing_id.get();
-            w.set_frag_editor_open(false);
-
-            let start_ms = parse_mmss(&w.get_frag_editor_start_text());
-            let end_ms = parse_mmss(&w.get_frag_editor_end_text());
-            let (start_ms, end_ms) = match (start_ms, end_ms) {
-                (Some(s), Some(e)) => (s, e),
-                _ => {
-                    w.set_frag_error_text("Invalid time format. Use m:ss.".into());
-                    w.set_frag_error_open(true);
-                    return;
-                }
-            };
-            let invalid = end_ms <= start_ms
-                || frag_overlaps(&current_fragments.borrow(), start_ms, end_ms, editing_id);
-            if invalid {
-                w.set_frag_error_text("Invalid range: end is before start, or it overlaps another fragment.".into());
-                w.set_frag_error_open(true);
-                return;
-            }
-
-            let id = current.get();
-            let title = w.get_frag_editor_title_text().to_string();
-            let result = if editing_id < 0 {
-                ui_db.create_fragment(id, start_ms, end_ms, &title, now_unix())
-                    .map(|_| ())
-            } else {
-                ui_db.update_fragment(editing_id, start_ms, end_ms, &title)
-            };
-            if let Err(e) = result {
-                log::error!("Сохранение фрагмента: {e}");
-            }
-            rebuild_viewer_fragments(id);
-        });
-    }
-
-    {
-        let weak = window.as_weak();
-        window.on_frag_editor_cancel(move || {
-            if let Some(w) = weak.upgrade() {
-                w.set_frag_editor_open(false);
-            }
-        });
-    }
-
-    {
-        let weak = window.as_weak();
-        window.on_frag_error_ok(move || {
-            if let Some(w) = weak.upgrade() {
-                w.set_frag_error_open(false);
-            }
-        });
-    }
-
-    // ПКМ-меню сегмента: «Редактировать» — открыть оверлей с текущими значениями.
-    {
-        let weak = window.as_weak();
-        let frag_editing_id = frag_editing_id.clone();
-        let frag_marking_start = frag_marking_start.clone();
-        let current_fragments = current_fragments.clone();
-        window.on_frag_edit(move |id| {
-            let Some(w) = weak.upgrade() else { return };
-            let id = id as i64;
-            let Some(f) = current_fragments.borrow().iter().find(|f| f.id == id).map(|f| {
-                (f.start_ms, f.end_ms, f.title.clone())
-            }) else {
-                return;
-            };
-            // Открытие редактора отменяет незавершённую разметку кнопкой.
-            frag_marking_start.set(None);
-            w.set_frag_marking(false);
-
-            frag_editing_id.set(id);
-            w.set_frag_editor_heading("Edit fragment".into());
-            w.set_frag_editor_title_text(f.2.into());
-            w.set_frag_editor_start_text(fmt_mmss(f.0).into());
-            w.set_frag_editor_end_text(fmt_mmss(f.1).into());
-            w.set_frag_editor_open(true);
-        });
-    }
-
-    // ПКМ-меню сегмента: «Удалить» — подтверждение, затем удаление.
-    {
-        let weak = window.as_weak();
-        let frag_delete_target = frag_delete_target.clone();
-        window.on_frag_delete_request(move |id| {
-            frag_delete_target.set(id as i64);
-            if let Some(w) = weak.upgrade() {
-                w.set_frag_delete_confirm_open(true);
-            }
-        });
-    }
-
-    {
-        let weak = window.as_weak();
-        let ui_db = ui_db.clone();
-        let current = current_open_id.clone();
-        let frag_delete_target = frag_delete_target.clone();
-        let rebuild_viewer_fragments = rebuild_viewer_fragments.clone();
-        window.on_frag_delete_confirm_ok(move || {
-            if let Err(e) = ui_db.delete_fragment(frag_delete_target.get()) {
-                log::error!("Удаление фрагмента: {e}");
-            }
-            if let Some(w) = weak.upgrade() {
-                w.set_frag_delete_confirm_open(false);
-            }
-            rebuild_viewer_fragments(current.get());
-        });
-    }
-
-    {
-        let weak = window.as_weak();
-        window.on_frag_delete_confirm_cancel(move || {
-            if let Some(w) = weak.upgrade() {
-                w.set_frag_delete_confirm_open(false);
-            }
-        });
-    }
-
-    // Таймер плеера: тянем позицию/длительность/паузу из mpv в UI.
-    let player_timer = slint::Timer::default();
-    {
-        let weak = window.as_weak();
-        let mpv = mpv_opt.clone();
-        let fullscreen = fullscreen.clone();
-        let last_activity = last_activity.clone();
-        let current_fragments = current_fragments.clone();
-        player_timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(250),
-            move || {
-                let Some(w) = weak.upgrade() else { return };
-                if !w.get_viewer_open() || !w.get_viewer_is_video() {
-                    return;
-                }
-                if let Some(mpv) = &mpv {
-                    let pos = mpv.get_double("time-pos").unwrap_or(0.0);
-                    let dur = mpv.get_double("duration").unwrap_or(0.0);
-                    w.set_viewer_pos(pos as f32);
-                    w.set_viewer_duration(dur as f32);
-                    w.set_viewer_time_text(
-                        format!("{} / {}", fmt_time(pos), fmt_time(dur)).into(),
-                    );
-                    if let Some(paused) = mpv.get_flag("pause") {
-                        w.set_viewer_paused(paused);
-                    }
-                    // Кнопки разметки фрагмента недоступны, пока позиция плеера
-                    // внутри уже существующего фрагмента (нельзя начинать/
-                    // заканчивать новый прямо посреди чужого диапазона).
-                    let pos_ms = (pos * 1000.0) as i64;
-                    let inside = current_fragments
-                        .borrow()
-                        .iter()
-                        .any(|f| f.start_ms <= pos_ms && pos_ms < f.end_ms);
-                    w.set_frag_buttons_disabled(inside);
-                }
-                // Авто-скрытие контролов в полноэкранном режиме.
-                if fullscreen.get() {
-                    let idle = last_activity.get().elapsed() > Duration::from_millis(2500);
-                    if idle && w.get_viewer_controls_visible() {
-                        w.set_viewer_controls_visible(false);
-                    }
-                } else if !w.get_viewer_controls_visible() {
-                    w.set_viewer_controls_visible(true);
-                }
-            },
-        );
-    }
 
     // --- mpv-пайплайн (render API под UI) ---
     // Ставится, если GL-контекст окажется аварийным: тогда выходим из цикла
@@ -1937,81 +1294,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let restart_software_gl = Rc::new(Cell::new(false));
 
     if let Some(mpv) = mpv_opt.clone() {
-        let render_ctx: Rc<Cell<*mut MpvRenderContext>> = Rc::new(Cell::new(std::ptr::null_mut()));
-        let weak_box: *mut slint::Weak<MainWindow> = Box::into_raw(Box::new(window.as_weak()));
-
-        let notifier_mpv = mpv.clone();
-        let notifier_ctx = render_ctx.clone();
-        let weak_for_redraw = window.as_weak();
-        let gate = render_video.clone();
         let can_fall_back = gl_mode.can_fall_back();
         let restart_flag = restart_software_gl.clone();
-
-        let res = window
-            .window()
-            .set_rendering_notifier(move |state, api| match state {
-                RenderingState::RenderingSetup => {
-                    if let GraphicsAPI::NativeOpenGL { get_proc_address } = api {
-                        // Чем нам достался GL: на сломанном стеке Mesa контекст
-                        // создаётся, но рендер mpv в FBO даёт чёрный кадр — ловим
-                        // это по строке GL_RENDERER и уходим на программный путь.
-                        if let Some(info) = unsafe { graphics::probe(*get_proc_address) } {
-                            log::info!(
-                                "GL: {} | {} | {}",
-                                info.renderer,
-                                info.vendor,
-                                info.version
-                            );
-                            if info.looks_broken() && can_fall_back {
-                                log::warn!(
-                                    "GL: контекст выглядит нерабочим ({}) — перезапускаюсь с программным рендерингом",
-                                    info.renderer
-                                );
-                                restart_flag.set(true);
-                                let _ = slint::quit_event_loop();
-                                return;
-                            }
-                        }
-
-                        match unsafe { notifier_mpv.create_render_context(*get_proc_address) } {
-                            Ok(ctx) => {
-                                notifier_ctx.set(ctx);
-                                unsafe {
-                                    notifier_mpv.set_update_callback(
-                                        ctx,
-                                        on_mpv_update,
-                                        weak_box as *mut std::ffi::c_void,
-                                    );
-                                }
-                                log::info!("mpv render-контекст создан");
-                            }
-                            Err(code) => log::error!("mpv_render_context_create -> {code}"),
-                        }
+        viewer::attach_mpv_renderer(
+            &window,
+            mpv,
+            main_viewer_state.render_video.clone(),
+            move |api| {
+                let GraphicsAPI::NativeOpenGL { get_proc_address } = api else {
+                    return true;
+                };
+                // Чем нам достался GL: на сломанном стеке Mesa контекст
+                // создаётся, но рендер mpv в FBO даёт чёрный кадр — ловим
+                // это по строке GL_RENDERER и уходим на программный путь.
+                if let Some(info) = unsafe { graphics::probe(*get_proc_address) } {
+                    log::info!("GL: {} | {} | {}", info.renderer, info.vendor, info.version);
+                    if info.looks_broken() && can_fall_back {
+                        log::warn!(
+                            "GL: контекст выглядит нерабочим ({}) — перезапускаюсь с программным рендерингом",
+                            info.renderer
+                        );
+                        restart_flag.set(true);
+                        let _ = slint::quit_event_loop();
+                        return false;
                     }
                 }
-                RenderingState::BeforeRendering => {
-                    let ctx = notifier_ctx.get();
-                    if gate.get() && !ctx.is_null() {
-                        if let Some(win) = weak_for_redraw.upgrade() {
-                            let size = win.window().size();
-                            unsafe {
-                                notifier_mpv.render(ctx, size.width as i32, size.height as i32);
-                            }
-                        }
-                    }
-                }
-                RenderingState::RenderingTeardown => {
-                    let ctx = notifier_ctx.replace(std::ptr::null_mut());
-                    if !ctx.is_null() {
-                        unsafe { notifier_mpv.free_render_context(ctx) };
-                    }
-                }
-                _ => {}
-            });
-
-        if let Err(e) = res {
-            log::warn!("Rendering notifier недоступен: {e:?}");
-        }
+                true
+            },
+            || {},
+        );
     }
 
     window.run()?;
